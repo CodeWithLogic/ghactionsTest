@@ -1,7 +1,7 @@
 jobs:
   build_push:
-    name: Build & Push (single job: artifacts + docker + uploads)
-    runs-on: ${{ vars.RUNNER_MEDIUM_LABEL }}
+    name: Build & Push 
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
