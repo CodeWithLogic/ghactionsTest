@@ -1,5 +1,14 @@
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      manual_op:
+        description: "Operation to perform"
+        required: true
+        type: choice
+        options:
+          - "Build only"
+          - "Deploy an image"
+        default: "Build only"
 
 jobs:
 
