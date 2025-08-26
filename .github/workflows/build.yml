@@ -1,3 +1,4 @@
+name: Maven Build
 on:
   workflow_dispatch:
     inputs:
