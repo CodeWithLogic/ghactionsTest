@@ -1,0 +1,106 @@
+jobs:
+  build_push:
+    name: Build & Push (single job: artifacts + docker + uploads)
+    runs-on: ${{ vars.RUNNER_MEDIUM_LABEL }}
+    permissions:
+      contents: write
+    env:
+      ART_URL: https://artifactory.gmail.com
+      GENERIC_REPO: generic-releases-local
+      ARTIFACTORY_REGISTRY: artifactory.gmail.com/paas-registry
+      DOCKERFILE_PATH: Dockerfile
+      BUILD_PATH: .
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image name from repo
+        id: imgname
+        shell: bash
+        run: |
+          REPO="${GITHUB_REPOSITORY##*/}"        # owner/repo -> repo
+          echo "IMAGE_NAME=${REPO}-image" >> $GITHUB_ENV
+          echo "image_name=${REPO}-image" >> $GITHUB_OUTPUT
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Maven
+        uses: stCarolas/setup-maven@v4.5
+        with:
+          maven-version: 3.9.9
+
+      - name: Install xmllint
+        run: sudo apt-get update && sudo apt-get install -y libxml2-utils
+
+      - name: Extract artifactId/version & compute tags
+        id: derive
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARTIFACT_ID=$(xmllint --xpath "//*[local-name()='project']/*[local-name()='artifactId']/text()" pom.xml)
+          RAW_VERSION=$(xmllint --xpath "//*[local-name()='project']/*[local-name()='version']/text()" pom.xml 2>/dev/null || true)
+          if [[ -z "${RAW_VERSION:-}" ]]; then
+            echo "Could not read <version> from pom.xml"; exit 1
+          fi
+          RELEASE_VERSION="${RAW_VERSION%-SNAPSHOT}"
+
+          IFS='.' read -r MAJ MIN PAT <<<"${RELEASE_VERSION}"
+          PAT=${PAT:-0}; PAT=$((PAT+1))
+          NEXT_VERSION="${MAJ}.${MIN}.${PAT}-SNAPSHOT"
+
+          RELEASE_TAG="${ARTIFACT_ID}-${RELEASE_VERSION}"
+
+          echo "artifact_id=$ARTIFACT_ID" >> $GITHUB_OUTPUT
+          echo "raw_version=$RAW_VERSION" >> $GITHUB_OUTPUT
+          echo "release_version=$RELEASE_VERSION" >> $GITHUB_OUTPUT
+          echo "next_version=$NEXT_VERSION" >> $GITHUB_OUTPUT
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Decide if this is a RELEASE run
+        id: flags
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == "main" && "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.manual_op }}" == "Deploy an image" ]]; then
+            echo "is_release=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_release=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update version to RELEASE (only on release)
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: |
+          mvn -B versions:set -DnewVersion='${{ steps.derive.outputs.release_version }}'
+          mvn -B versions:commit
+
+      - name: Build with Maven (produces .tar.gz under target/)
+        run: |
+          chmod +x ./mvnw || true
+          ./mvnw -q -DskipTests -U clean package
+
+      - name: Upload artifact for release version (GH Artifact)
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.derive.outputs.artifact_id }}-${{ steps.derive.outputs.release_version }}
+          path: '**/target/*.tar.gz'
+          if-no-files-found: error
+
+      - name: Bump version to NEXT -SNAPSHOT (and push)
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: |
+          mvn -B versions:set -DnewVersion='${{ steps.derive.outputs.next_version }}'
+          mvn -B versions:commit
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add pom.xml
+          git commit -m "Bump version to ${{ steps.derive.outputs.next_version }}" || echo "No changes"
+          git push origin "${{ github.ref_name }}"
+
+      - name: Print summary
+        run: |
+          echo "Released Version: ${{ steps.derive.outputs.release_version }}"
+          echo "Release Tag:      ${{ steps.derive.outputs.release_tag }}"
