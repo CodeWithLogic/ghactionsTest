@@ -13,10 +13,10 @@ on:
           - "Deploy"
         default: "Build only"
       release_tag:
-        description: "[Deploy] Existing release tag to use (e.g., productservice-1.0.0)"
+        description: "[Deploy] Existing release tag (e.g., productservice-1.0.0)"
         required: false
       manual_env:
-        description: "[Deploy] Target env: e1, e2, or e3 (deploys sequentially up to that env)"
+        description: "Target env: e1, e2, or e3 (deploys sequentially up to that env)"
         required: false
         default: "e1"
 
@@ -25,14 +25,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ============================================================
-  # Build path (Build only / Build & Deploy) - unchanged from earlier
-  # ============================================================
+  # ===========================================
+  # BUILD PATH (Build only / Build & Deploy)
+  # ===========================================
   pipeline:
     if: ${{ github.event.inputs.operation != 'Deploy' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      image: ${{ steps.checksums.outputs.image }}
+      digest: ${{ steps.checksums.outputs.digest }}
+      release_tag: ${{ steps.derive.outputs.release_tag }}
+      version: ${{ steps.derive.outputs.release_version }}
     env:
       DOCKERFILE_PATH: Dockerfile
       BUILD_PATH: .
@@ -40,17 +45,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
       - name: Setup Java & Maven
         uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
+        with: { java-version: '17', distribution: 'temurin' }
       - uses: stCarolas/setup-maven@v4.5
-        with:
-          maven-version: 3.9.9
+        with: { maven-version: 3.9.9 }
 
       - name: Install tools (xmllint, jq)
         run: |
@@ -87,7 +88,7 @@ jobs:
             echo "is_release=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # -------------------- Build only --------------------
+      # ---------- Build only ----------
       - name: Build (snapshot)
         if: ${{ steps.flags.outputs.op == 'Build only' }}
         run: mvn -q -DskipTests -U clean package
@@ -100,7 +101,7 @@ jobs:
           path: "**/target/*"
           if-no-files-found: error
 
-      # -------------------- Build & Deploy (release) --------------------
+      # ---------- Build & Deploy (release) ----------
       - name: "Guard: branch must be main"
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: |
@@ -121,7 +122,6 @@ jobs:
             echo "::error::Tag ${{ steps.derive.outputs.release_tag }} already exists"; exit 1
           fi
 
-      # Set version -> commit -> tag
       - name: Set version to RELEASE and commit
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: |
@@ -161,7 +161,6 @@ jobs:
           fi
           echo "::error::Neither $BASE_TAR nor $BASE_JAR found under */target/*"; exit 1
 
-      # Local Docker image (no registry)
       - name: Set up Docker Buildx
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         uses: docker/setup-buildx-action@v3
@@ -190,6 +189,10 @@ jobs:
           IMAGE_ID="$(docker inspect --format='{{.Id}}' "$IMG")"
           echo "$IMG@$IMAGE_ID" | tee image-digest.txt
           sha256sum "${{ steps.artifact.outputs.artifact_path }}" | tee tar-sha256.txt
+          # expose as step outputs
+          echo "image=$IMG" >> "$GITHUB_OUTPUT"
+          echo "digest=$IMAGE_ID" >> "$GITHUB_OUTPUT"
+          # also make a machine-readable blob
           jq -n --arg artifactId "${{ steps.derive.outputs.artifact_id }}" \
                 --arg version "${{ steps.derive.outputs.release_version }}" \
                 --arg commit "${GITHUB_SHA}" \
@@ -209,14 +212,13 @@ jobs:
           body: |
             Automated release **${{ steps.derive.outputs.release_tag }}**
 
-            **Docker image (local build; no registry push in this test pipeline)**  
             Local image reference + ID:
             ```
-            local/${{ steps.derive.outputs.artifact_id }}:${{ steps.derive.outputs.release_version }}@$(cat image-digest.txt | cut -d@ -f2)
+            ${{ steps.checksums.outputs.image }}@${{ steps.checksums.outputs.digest }}
             ```
 
-            **Artifact checksum (SHA256)** is attached in `tar-sha256.txt`.  
-            Machine-readable metadata is in `release.json`.
+            **Artifact checksum (SHA256)** attached in `tar-sha256.txt`.  
+            Machine-readable metadata in `release.json`.
           files: |
             ${{ steps.artifact.outputs.artifact_path }}
             image-digest.txt
@@ -234,14 +236,13 @@ jobs:
           git commit -m "Bump version to ${{ steps.derive.outputs.next_version }}" || echo "No changes"
           git push origin "${GITHUB_REF_NAME}"
 
-  # ============================================================
-  # Deploy path (dummy) — fetch once, then deploy to e1/e2/e3
-  # ============================================================
+  # ===========================================
+  # DEPLOY PATH (from an existing tag)
+  # ===========================================
   fetch_release:
     if: ${{ github.event.inputs.operation == 'Deploy' }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    permissions: { contents: read }
     outputs:
       image:  ${{ steps.extract.outputs.image }}
       digest: ${{ steps.extract.outputs.digest }}
@@ -273,12 +274,10 @@ jobs:
           IMAGE=""; DIGEST=""; VERSION=""
           if [[ -f release.json ]]; then
             IMAGE=$(jq -r '.image // empty' release.json)
-            # Prefer remote digest if present; otherwise fallback to imageId (local build case)
             DIGEST=$(jq -r '.digest // .imageId // empty' release.json)
             VERSION=$(jq -r '.version // empty' release.json)
           fi
           if [[ -z "$IMAGE" && -f image-digest.txt ]]; then
-            # Format: <imageRef>@<sha256...>  (local or remote)
             IMAGE=$(cut -d'@' -f1 image-digest.txt || true)
             DIGEST=$(cut -d'@' -f2 image-digest.txt || true)
           fi
@@ -286,7 +285,6 @@ jobs:
           echo "image=$IMAGE"   >> "$GITHUB_OUTPUT"
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Resolved from tag '${{ github.event.inputs.release_tag }}': $IMAGE@$DIGEST"
 
   deploy_e1:
     if: ${{ github.event.inputs.operation == 'Deploy' && (github.event.inputs.manual_env == 'e1' || github.event.inputs.manual_env == 'e2' || github.event.inputs.manual_env == 'e3') }}
@@ -297,15 +295,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          EXPECT_IMAGE="${{ needs.fetch_release.outputs.image }}"
-          EXPECT_DIGEST="${{ needs.fetch_release.outputs.digest }}"
-          IMAGE_TO_USE="$EXPECT_IMAGE"
-          DIGEST_TO_USE="$EXPECT_DIGEST"
-          [[ "$IMAGE_TO_USE" == "$EXPECT_IMAGE" && "$DIGEST_TO_USE" == "$EXPECT_DIGEST" ]] || { echo "::error::Image/digest mismatch at e1"; exit 1; }
-          echo "e1 will deploy: $IMAGE_TO_USE@$DIGEST_TO_USE"
-
+          echo "e1 will deploy: ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
       - name: "Deploy to e1 (dummy)"
-        run: echo "Pretend deploy to e1 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
+        run: echo "Pretend deploy e1 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
 
   deploy_e2:
     if: ${{ github.event.inputs.operation == 'Deploy' && (github.event.inputs.manual_env == 'e2' || github.event.inputs.manual_env == 'e3') }}
@@ -316,15 +308,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          EXPECT_IMAGE="${{ needs.fetch_release.outputs.image }}"
-          EXPECT_DIGEST="${{ needs.fetch_release.outputs.digest }}"
-          IMAGE_TO_USE="$EXPECT_IMAGE"
-          DIGEST_TO_USE="$EXPECT_DIGEST"
-          [[ "$IMAGE_TO_USE" == "$EXPECT_IMAGE" && "$DIGEST_TO_USE" == "$EXPECT_DIGEST" ]] || { echo "::error::Image/digest mismatch at e2"; exit 1; }
-          echo "e2 will deploy: $IMAGE_TO_USE@$DIGEST_TO_USE"
-
+          echo "e2 will deploy: ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
       - name: "Deploy to e2 (dummy)"
-        run: echo "Pretend deploy to e2 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
+        run: echo "Pretend deploy e2 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
 
   deploy_e3:
     if: ${{ github.event.inputs.operation == 'Deploy' && github.event.inputs.manual_env == 'e3' }}
@@ -335,12 +321,39 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          EXPECT_IMAGE="${{ needs.fetch_release.outputs.image }}"
-          EXPECT_DIGEST="${{ needs.fetch_release.outputs.digest }}"
-          IMAGE_TO_USE="$EXPECT_IMAGE"
-          DIGEST_TO_USE="$EXPECT_DIGEST"
-          [[ "$IMAGE_TO_USE" == "$EXPECT_IMAGE" && "$DIGEST_TO_USE" == "$EXPECT_DIGEST" ]] || { echo "::error::Image/digest mismatch at e3"; exit 1; }
-          echo "e3 will deploy: $IMAGE_TO_USE@$DIGEST_TO_USE"
-
+          echo "e3 will deploy: ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
       - name: "Deploy to e3 (dummy)"
-        run: echo "Pretend deploy to e3 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
+        run: echo "Pretend deploy e3 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
+
+  # ===========================================
+  # BUILD-&-DEPLOY PATH (same run, after build)
+  # ===========================================
+  bd_deploy_e1:
+    if: ${{ github.event.inputs.operation == 'Build & Deploy' && (github.event.inputs.manual_env == 'e1' || github.event.inputs.manual_env == 'e2' || github.event.inputs.manual_env == 'e3') }}
+    needs: [pipeline]
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Gate: ensure image from build (e1)"
+        run: echo "e1 will deploy: ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+      - name: "Deploy to e1 (dummy)"
+        run: echo "Pretend deploy e1 with ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+
+  bd_deploy_e2:
+    if: ${{ github.event.inputs.operation == 'Build & Deploy' && (github.event.inputs.manual_env == 'e2' || github.event.inputs.manual_env == 'e3') }}
+    needs: [pipeline, bd_deploy_e1]
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Gate: ensure image from build (e2)"
+        run: echo "e2 will deploy: ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+      - name: "Deploy to e2 (dummy)"
+        run: echo "Pretend deploy e2 with ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+
+  bd_deploy_e3:
+    if: ${{ github.event.inputs.operation == 'Build & Deploy' && github.event.inputs.manual_env == 'e3' }}
+    needs: [pipeline, bd_deploy_e2]
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Gate: ensure image from build (e3)"
+        run: echo "e3 will deploy: ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+      - name: "Deploy to e3 (dummy)"
+        run: echo "Pretend deploy e3 with ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
