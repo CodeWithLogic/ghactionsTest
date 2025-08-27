@@ -10,18 +10,26 @@ on:
         options:
           - "Build only"
           - "Build & Deploy"
-          - "Deploy only"
+          - "Deploy"
         default: "Build only"
       release_tag:
-        description: "[Deploy only] Existing release tag to use (e.g., productservice-1.0.0)"
+        description: "[Deploy] Existing release tag to use (e.g., productservice-1.0.0)"
         required: false
+      manual_env:
+        description: "[Deploy] Target env: e1, e2, or e3 (deploys sequentially up to that env)"
+        required: false
+        default: "e1"
 
 concurrency:
   group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
+  # ============================================================
+  # Build path (Build only / Build & Deploy) - unchanged from earlier
+  # ============================================================
   pipeline:
+    if: ${{ github.event.inputs.operation != 'Deploy' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -78,11 +86,6 @@ jobs:
           else
             echo "is_release=false" >> "$GITHUB_OUTPUT"
           fi
-          if [[ "$OP" == "Deploy only" ]]; then
-            echo "is_deploy_only=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_deploy_only=false" >> "$GITHUB_OUTPUT"
-          fi
 
       # -------------------- Build only --------------------
       - name: Build (snapshot)
@@ -97,36 +100,7 @@ jobs:
           path: "**/target/*"
           if-no-files-found: error
 
-      # -------------------- Deploy only --------------------
-      - name: "Guard: release_tag provided"
-        if: ${{ steps.flags.outputs.is_deploy_only == 'true' }}
-        run: |
-          test -n "${{ github.event.inputs.release_tag }}" || { echo "::error::Please provide input release_tag"; exit 1; }
-
-      - name: Download release assets (image digest/id + checksum)
-        if: ${{ steps.flags.outputs.is_deploy_only == 'true' }}
-        uses: robinraju/release-downloader@v1
-        with:
-          tag: ${{ github.event.inputs.release_tag }}
-          fileName: |
-            image-digest.txt
-            tar-sha256.txt
-            release.json
-          tarBall: false
-          zipBall: false
-
-      - name: Show digest/id for deploy team
-        if: ${{ steps.flags.outputs.is_deploy_only == 'true' }}
-        run: |
-          echo "===== image-digest.txt ====="
-          cat image-digest.txt || true
-          echo "===== tar-sha256.txt ====="
-          cat tar-sha256.txt || true
-          echo "===== release.json ====="
-          cat release.json || true
-
       # -------------------- Build & Deploy (release) --------------------
-      # Guardrails
       - name: "Guard: branch must be main"
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: |
@@ -147,7 +121,7 @@ jobs:
             echo "::error::Tag ${{ steps.derive.outputs.release_tag }} already exists"; exit 1
           fi
 
-      # Release: set version -> commit -> tag
+      # Set version -> commit -> tag
       - name: Set version to RELEASE and commit
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: |
@@ -165,7 +139,6 @@ jobs:
           git push origin "${GITHUB_REF_NAME}"
           git push origin "${{ steps.derive.outputs.release_tag }}"
 
-      # Build once
       - name: Build (release)
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: mvn -q -DskipTests -U clean package
@@ -188,7 +161,7 @@ jobs:
           fi
           echo "::error::Neither $BASE_TAR nor $BASE_JAR found under */target/*"; exit 1
 
-      # ---- Build Docker image LOCALLY (no registry, no creds) ----
+      # Local Docker image (no registry)
       - name: Set up Docker Buildx
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         uses: docker/setup-buildx-action@v3
@@ -242,8 +215,6 @@ jobs:
             local/${{ steps.derive.outputs.artifact_id }}:${{ steps.derive.outputs.release_version }}@$(cat image-digest.txt | cut -d@ -f2)
             ```
 
-            > Note: For production, switch to pushing the image to your registry and publish the remote digest here.
-
             **Artifact checksum (SHA256)** is attached in `tar-sha256.txt`.  
             Machine-readable metadata is in `release.json`.
           files: |
@@ -263,7 +234,113 @@ jobs:
           git commit -m "Bump version to ${{ steps.derive.outputs.next_version }}" || echo "No changes"
           git push origin "${GITHUB_REF_NAME}"
 
-      - name: Summary
+  # ============================================================
+  # Deploy path (dummy) — fetch once, then deploy to e1/e2/e3
+  # ============================================================
+  fetch_release:
+    if: ${{ github.event.inputs.operation == 'Deploy' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image:  ${{ steps.extract.outputs.image }}
+      digest: ${{ steps.extract.outputs.digest }}
+      version: ${{ steps.extract.outputs.version }}
+    steps:
+      - name: "Guard: release_tag provided"
         run: |
-          echo "operation = ${{ steps.flags.outputs.op }}"
-          echo "release_tag = ${{ steps.derive.outputs.release_tag }}"
+          test -n "${{ github.event.inputs.release_tag }}" || { echo "::error::Please provide input release_tag"; exit 1; }
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Download release assets
+        uses: robinraju/release-downloader@v1
+        with:
+          tag: ${{ github.event.inputs.release_tag }}
+          fileName: |
+            image-digest.txt
+            tar-sha256.txt
+            release.json
+          tarBall: false
+          zipBall: false
+
+      - name: Extract image + digest from assets
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE=""; DIGEST=""; VERSION=""
+          if [[ -f release.json ]]; then
+            IMAGE=$(jq -r '.image // empty' release.json)
+            # Prefer remote digest if present; otherwise fallback to imageId (local build case)
+            DIGEST=$(jq -r '.digest // .imageId // empty' release.json)
+            VERSION=$(jq -r '.version // empty' release.json)
+          fi
+          if [[ -z "$IMAGE" && -f image-digest.txt ]]; then
+            # Format: <imageRef>@<sha256...>  (local or remote)
+            IMAGE=$(cut -d'@' -f1 image-digest.txt || true)
+            DIGEST=$(cut -d'@' -f2 image-digest.txt || true)
+          fi
+          [[ -n "$IMAGE" && -n "$DIGEST" ]] || { echo "::error::Could not resolve image/digest from release assets"; exit 1; }
+          echo "image=$IMAGE"   >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved from tag '${{ github.event.inputs.release_tag }}': $IMAGE@$DIGEST"
+
+  deploy_e1:
+    if: ${{ github.event.inputs.operation == 'Deploy' && (github.event.inputs.manual_env == 'e1' || github.event.inputs.manual_env == 'e2' || github.event.inputs.manual_env == 'e3') }}
+    needs: [fetch_release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Gate: ensure image matches release (e1)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXPECT_IMAGE="${{ needs.fetch_release.outputs.image }}"
+          EXPECT_DIGEST="${{ needs.fetch_release.outputs.digest }}"
+          IMAGE_TO_USE="$EXPECT_IMAGE"
+          DIGEST_TO_USE="$EXPECT_DIGEST"
+          [[ "$IMAGE_TO_USE" == "$EXPECT_IMAGE" && "$DIGEST_TO_USE" == "$EXPECT_DIGEST" ]] || { echo "::error::Image/digest mismatch at e1"; exit 1; }
+          echo "e1 will deploy: $IMAGE_TO_USE@$DIGEST_TO_USE"
+
+      - name: "Deploy to e1 (dummy)"
+        run: echo "Pretend deploy to e1 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
+
+  deploy_e2:
+    if: ${{ github.event.inputs.operation == 'Deploy' && (github.event.inputs.manual_env == 'e2' || github.event.inputs.manual_env == 'e3') }}
+    needs: [fetch_release, deploy_e1]
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Gate: ensure image matches release (e2)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXPECT_IMAGE="${{ needs.fetch_release.outputs.image }}"
+          EXPECT_DIGEST="${{ needs.fetch_release.outputs.digest }}"
+          IMAGE_TO_USE="$EXPECT_IMAGE"
+          DIGEST_TO_USE="$EXPECT_DIGEST"
+          [[ "$IMAGE_TO_USE" == "$EXPECT_IMAGE" && "$DIGEST_TO_USE" == "$EXPECT_DIGEST" ]] || { echo "::error::Image/digest mismatch at e2"; exit 1; }
+          echo "e2 will deploy: $IMAGE_TO_USE@$DIGEST_TO_USE"
+
+      - name: "Deploy to e2 (dummy)"
+        run: echo "Pretend deploy to e2 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
+
+  deploy_e3:
+    if: ${{ github.event.inputs.operation == 'Deploy' && github.event.inputs.manual_env == 'e3' }}
+    needs: [fetch_release, deploy_e2]
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Gate: ensure image matches release (e3)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXPECT_IMAGE="${{ needs.fetch_release.outputs.image }}"
+          EXPECT_DIGEST="${{ needs.fetch_release.outputs.digest }}"
+          IMAGE_TO_USE="$EXPECT_IMAGE"
+          DIGEST_TO_USE="$EXPECT_DIGEST"
+          [[ "$IMAGE_TO_USE" == "$EXPECT_IMAGE" && "$DIGEST_TO_USE" == "$EXPECT_DIGEST" ]] || { echo "::error::Image/digest mismatch at e3"; exit 1; }
+          echo "e3 will deploy: $IMAGE_TO_USE@$DIGEST_TO_USE"
+
+      - name: "Deploy to e3 (dummy)"
+        run: echo "Pretend deploy to e3 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
