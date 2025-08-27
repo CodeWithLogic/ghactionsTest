@@ -1,4 +1,5 @@
 name: Maven Build
+
 on:
   workflow_dispatch:
     inputs:
@@ -12,9 +13,8 @@ on:
         default: "Build only"
 
 jobs:
-
   build_push:
-    name: Build & Push 
+    name: "Build & Push (artifacts + docker + uploads)"
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -26,15 +26,18 @@ jobs:
       BUILD_PATH: .
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Compute image name from repo
         id: imgname
         shell: bash
         run: |
-          REPO="${GITHUB_REPOSITORY##*/}"        # owner/repo -> repo
-          echo "IMAGE_NAME=${REPO}-image" >> $GITHUB_ENV
-          echo "image_name=${REPO}-image" >> $GITHUB_OUTPUT
+          REPO="${GITHUB_REPOSITORY##*/}"
+          echo "IMAGE_NAME=${REPO}-image" >> "$GITHUB_ENV"
+          echo "image_name=${REPO}-image" >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -61,27 +64,26 @@ jobs:
             echo "Could not read <version> from pom.xml"; exit 1
           fi
           RELEASE_VERSION="${RAW_VERSION%-SNAPSHOT}"
-
-          IFS='.' read -r MAJ MIN PAT <<<"${RELEASE_VERSION}"
+          IFS='.' read -r MAJ MIN PAT <<< "${RELEASE_VERSION}"
           PAT=${PAT:-0}; PAT=$((PAT+1))
           NEXT_VERSION="${MAJ}.${MIN}.${PAT}-SNAPSHOT"
-
           RELEASE_TAG="${ARTIFACT_ID}-${RELEASE_VERSION}"
-
-          echo "artifact_id=$ARTIFACT_ID" >> $GITHUB_OUTPUT
-          echo "raw_version=$RAW_VERSION" >> $GITHUB_OUTPUT
-          echo "release_version=$RELEASE_VERSION" >> $GITHUB_OUTPUT
-          echo "next_version=$NEXT_VERSION" >> $GITHUB_OUTPUT
-          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+          {
+            echo "artifact_id=$ARTIFACT_ID"
+            echo "raw_version=$RAW_VERSION"
+            echo "release_version=$RELEASE_VERSION"
+            echo "next_version=$NEXT_VERSION"
+            echo "release_tag=$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Decide if this is a RELEASE run
         id: flags
         shell: bash
         run: |
           if [[ "${GITHUB_REF_NAME}" == "main" && "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.manual_op }}" == "Deploy an image" ]]; then
-            echo "is_release=true" >> $GITHUB_OUTPUT
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
           else
-            echo "is_release=false" >> $GITHUB_OUTPUT
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Update version to RELEASE (only on release)
@@ -92,20 +94,45 @@ jobs:
 
       - name: Build with Maven (produces .tar.gz under target/)
         run: |
-          chmod +x ./mvnw || true
-          ./mvnw -q -DskipTests -U clean package
-		  
-	  - name: Inspect build outputs
-	    run: |
-		  ls -la target || true
-		  find . -type f -name "*.tar.gz" -o -name "*.jar"
+          mvn -q -DskipTests -U clean package
 
-      - name: Upload artifact for release version (GH Artifact)
+      - name: Inspect build outputs
+        run: |
+          pwd
+          echo "---- list targets ----"
+          find . -type d -name target -maxdepth 3 -print
+          echo "---- find tar/jar ----"
+          find . -type f -path "*/target/*" \( -name "*.tar.gz" -o -name "*.jar" \) | sed -n '1,200p'
+
+      - name: Locate artifact file (tar preferred, jar fallback)
+        id: artifact
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_TAR="${{ steps.derive.outputs.artifact_id }}-${{ steps.derive.outputs.release_version }}.tar.gz"
+          BASE_JAR="${{ steps.derive.outputs.artifact_id }}-${{ steps.derive.outputs.release_version }}.jar"
+          TAR_PATH="$(find . -type f -path '*/target/*' -name "$BASE_TAR" | head -n 1 || true)"
+          if [[ -n "$TAR_PATH" ]]; then
+            echo "artifact_path=$TAR_PATH" >> "$GITHUB_OUTPUT"
+            echo "artifact_name=${{ steps.derive.outputs.artifact_id }}-${{ steps.derive.outputs.release_version }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          JAR_PATH="$(find . -type f -path '*/target/*' -name "$BASE_JAR" | head -n 1 || true)"
+          if [[ -n "$JAR_PATH" ]]; then
+            echo "artifact_path=$JAR_PATH" >> "$GITHUB_OUTPUT"
+            echo "artifact_name=${{ steps.derive.outputs.artifact_id }}-${{ steps.derive.outputs.release_version }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::error::Could not find either $BASE_TAR or $BASE_JAR under any */target/*"
+          exit 1
+
+      - name: Upload release artifact
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.derive.outputs.artifact_id }}-${{ steps.derive.outputs.release_version }}
-          path: '**/target/*.tar.gz'
+          name: ${{ steps.artifact.outputs.artifact_name }}
+          path: ${{ steps.artifact.outputs.artifact_path }}
           if-no-files-found: error
 
       - name: Bump version to NEXT -SNAPSHOT (and push)
