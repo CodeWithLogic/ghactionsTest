@@ -1,4 +1,4 @@
-name: Deploy
+name: Build / Release
 
 on:
   workflow_dispatch:
@@ -41,7 +41,9 @@ jobs:
     env:
       DOCKERFILE_PATH: Dockerfile
       BUILD_PATH: .
-      MAVEN_SETTINGS_FILE: settings.xml  # root of repo
+      MAVEN_SETTINGS_FILE: settings.xml
+      ARTIFACTORY_USERNAME: ${{ secrets.ARTIFACTORY_USERNAME }}
+      ARTIFACTORY_PASSWORD: ${{ secrets.ARTIFACTORY_PASSWORD }}
 
     steps:
       - name: Checkout
@@ -83,7 +85,6 @@ jobs:
           IFS='.' read -r MAJ MIN PAT <<< "${RELEASE_VERSION}"; PAT=${PAT:-0}; NEXT_VERSION="${MAJ}.${MIN}.$((PAT+1))-SNAPSHOT"
           RELEASE_TAG="${ARTIFACT_ID}-${RELEASE_VERSION}"
 
-          # distributionManagement repos
           SNAP_ID=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='distributionManagement']/*[local-name()='snapshotRepository']/*[local-name()='id'])" pom.xml 2>/dev/null || true)
           SNAP_URL=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='distributionManagement']/*[local-name()='snapshotRepository']/*[local-name()='url'])" pom.xml 2>/dev/null || true)
           REL_ID=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='distributionManagement']/*[local-name()='repository']/*[local-name()='id'])" pom.xml 2>/dev/null || true)
@@ -260,7 +261,6 @@ jobs:
             tar-sha256.txt
             release.json
 
-      # ---------- Maven deploy to Artifactory (release to /prod) ----------
       - name: Maven deploy primary artifacts to prod
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: |
@@ -275,7 +275,6 @@ jobs:
           PKG="${FILE##*.}"
           if [[ "$FILE" == *.tar.gz ]]; then PKG="tar.gz"; fi
 
-          # Use distributionManagement/repository id+url from pom.xml
           RID='${{ steps.derive.outputs.rel_id }}'
           RURL='${{ steps.derive.outputs.rel_url }}'
           G='${{ steps.derive.outputs.group_id }}'
@@ -283,44 +282,24 @@ jobs:
           V='${{ steps.derive.outputs.release_version }}'
 
           mvn -B -s "${MAVEN_SETTINGS_FILE}" deploy:deploy-file \
-            -DrepositoryId="${RID}" \
-            -Durl="${RURL}" \
-            -DgroupId="${G}" \
-            -DartifactId="${A}" \
-            -Dversion="${V}" \
-            -Dfile="${FILE}" \
-            -Dpackaging="${PKG}" \
-            -Dclassifier=dist
+            -DrepositoryId="${RID}" -Durl="${RURL}" \
+            -DgroupId="${G}" -DartifactId="${A}" -Dversion="${V}" \
+            -Dfile="${FILE}" -Dpackaging="${PKG}" -Dclassifier=dist
 
           mvn -B -s "${MAVEN_SETTINGS_FILE}" deploy:deploy-file \
-            -DrepositoryId="${RID}" \
-            -Durl="${RURL}" \
-            -DgroupId="${G}" \
-            -DartifactId="${A}" \
-            -Dversion="${V}" \
-            -Dfile="image-digest.txt" \
-            -Dpackaging=txt \
-            -Dclassifier=image-digest
+            -DrepositoryId="${RID}" -Durl="${RURL}" \
+            -DgroupId="${G}" -DartifactId="${A}" -Dversion="${V}" \
+            -Dfile="image-digest.txt" -Dpackaging=txt -Dclassifier=image-digest
 
           mvn -B -s "${MAVEN_SETTINGS_FILE}" deploy:deploy-file \
-            -DrepositoryId="${RID}" \
-            -Durl="${RURL}" \
-            -DgroupId="${G}" \
-            -DartifactId="${A}" \
-            -Dversion="${V}" \
-            -Dfile="tar-sha256.txt" \
-            -Dpackaging=txt \
-            -Dclassifier=tar-sha256
+            -DrepositoryId="${RID}" -Durl="${RURL}" \
+            -DgroupId="${G}" -DartifactId="${A}" -Dversion="${V}" \
+            -Dfile="tar-sha256.txt" -Dpackaging=txt -Dclassifier=tar-sha256
 
           mvn -B -s "${MAVEN_SETTINGS_FILE}" deploy:deploy-file \
-            -DrepositoryId="${RID}" \
-            -Durl="${RURL}" \
-            -DgroupId="${G}" \
-            -DartifactId="${A}" \
-            -Dversion="${V}" \
-            -Dfile="release.json" \
-            -Dpackaging=json \
-            -Dclassifier=metadata
+            -DrepositoryId="${RID}" -Durl="${RURL}" \
+            -DgroupId="${G}" -DartifactId="${A}" -Dversion="${V}" \
+            -Dfile="release.json" -Dpackaging=json -Dclassifier=metadata
 
       - name: Bump back to next SNAPSHOT and push
         if: ${{ steps.flags.outputs.is_release == 'true' }}
@@ -334,7 +313,7 @@ jobs:
           git push origin "${GITHUB_REF_NAME}"
 
   # ===========================================
-  # DEPLOY PATH (from an existing tag) — same as before
+  # DEPLOY PATH (from an existing tag)
   # ===========================================
   fetch_release:
     if: ${{ github.event.inputs.operation == 'Deploy' }}
@@ -420,3 +399,42 @@ jobs:
       - name: Deploy to e3 dummy
         run: |
           echo "Pretend deploy e3 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
+
+  # ===========================================
+  # BUILD-&-DEPLOY PATH (same run, after build)
+  # ===========================================
+  bd_deploy_e1:
+    if: ${{ github.event.inputs.operation == 'Build & Deploy' && (github.event.inputs.manual_env == 'e1' || github.event.inputs.manual_env == 'e2' || github.event.inputs.manual_env == 'e3') }}
+    needs: [pipeline]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate ensure image from build e1
+        run: |
+          echo "e1 will deploy: ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+      - name: Deploy to e1 dummy
+        run: |
+          echo "Pretend deploy e1 with ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+
+  bd_deploy_e2:
+    if: ${{ github.event.inputs.operation == 'Build & Deploy' && (github.event.inputs.manual_env == 'e2' || github.event.inputs.manual_env == 'e3') }}
+    needs: [pipeline, bd_deploy_e1]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate ensure image from build e2
+        run: |
+          echo "e2 will deploy: ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+      - name: Deploy to e2 dummy
+        run: |
+          echo "Pretend deploy e2 with ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+
+  bd_deploy_e3:
+    if: ${{ github.event.inputs.operation == 'Build & Deploy' && github.event.inputs.manual_env == 'e3' }}
+    needs: [pipeline, bd_deploy_e2]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate ensure image from build e3
+        run: |
+          echo "e3 will deploy: ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+      - name: Deploy to e3 dummy
+        run: |
+          echo "Pretend deploy e3 with ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
