@@ -12,9 +12,6 @@ on:
           - "Build & Deploy"
           - "Deploy only"
         default: "Build only"
-      confirm_tag:
-        description: "[Build & Deploy only] Paste exact tag (e.g., productservice-1.0.0)"
-        required: false
       release_tag:
         description: "[Deploy only] Existing release tag to use (e.g., productservice-1.0.0)"
         required: false
@@ -149,14 +146,6 @@ jobs:
           if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.derive.outputs.release_tag }}" >/dev/null 2>&1; then
             echo "::error::Tag ${{ steps.derive.outputs.release_tag }} already exists"; exit 1
           fi
-
-      - name: "Guard: human confirmation of tag"
-        if: ${{ steps.flags.outputs.is_release == 'true' }}
-        run: |
-          EXPECT="${{ steps.derive.outputs.release_tag }}"
-          CONF="${{ github.event.inputs.confirm_tag }}"
-          [[ -n "$CONF" ]] || { echo "::error::Provide confirm_tag=${EXPECT}"; exit 1; }
-          [[ "$CONF" == "$EXPECT" ]] || { echo "::error::confirm_tag mismatch: got '$CONF', expected '$EXPECT'"; exit 1; }
 
       # Release: set version -> commit -> tag
       - name: Set version to RELEASE and commit
