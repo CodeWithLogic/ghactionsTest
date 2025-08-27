@@ -1,4 +1,4 @@
-name: Deploy
+name: Build / Release
 
 on:
   workflow_dispatch:
@@ -34,14 +34,15 @@ jobs:
     permissions:
       contents: write
     outputs:
-      image: ${{ steps.checksums.outputs.image }}
-      digest: ${{ steps.checksums.outputs.digest }}
+      image: ${{ steps.imagedigest.outputs.image }}
+      digest: ${{ steps.imagedigest.outputs.digest }}
       release_tag: ${{ steps.derive.outputs.release_tag }}
       version: ${{ steps.derive.outputs.release_version }}
     env:
       DOCKERFILE_PATH: Dockerfile
       BUILD_PATH: .
       MAVEN_SETTINGS_FILE: settings.xml
+      # Needed for Maven + registry digest lookup
       ARTIFACTORY_USERNAME: ${{ secrets.ARTIFACTORY_USERNAME }}
       ARTIFACTORY_PASSWORD: ${{ secrets.ARTIFACTORY_PASSWORD }}
 
@@ -199,45 +200,73 @@ jobs:
           fi
           echo "::error::No tar.gz or jar found under */target/*"; exit 1
 
-      - name: Setup Docker Buildx
-        if: ${{ steps.flags.outputs.is_release == 'true' }}
-        uses: docker/setup-buildx-action@v3
+      # ---------- ONE Docker build/push step (for BOTH paths) ----------
+      - name: Resolve APP_VERSION (release vs snapshot)
+        if: ${{ github.event.inputs.operation != 'Deploy' }}
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${{ steps.flags.outputs.is_release }}" == "true" ]]; then
+            echo "app_version=${{ steps.derive.outputs.release_version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "app_version=${{ steps.derive.outputs.raw_version }}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Resolved APP_VERSION=$(grep '^app_version=' "$GITHUB_OUTPUT" | tail -n1 | cut -d= -f2)"
 
-      - name: Build local image no push
-        id: docker_local
-        if: ${{ steps.flags.outputs.is_release == 'true' }}
-        uses: docker/build-push-action@v6
+      - name: Set Docker build defaults
+        if: ${{ github.event.inputs.operation != 'Deploy' }}
+        id: build_defaults
+        run: |
+          echo "registry=artifactory.gmail.com/paas-registry" >> "$GITHUB_OUTPUT"
+          echo "dockerfile_path=${{ env.DOCKERFILE_PATH }}" >> "$GITHUB_OUTPUT"
+          echo "build_path=${{ env.BUILD_PATH }}" >> "$GITHUB_OUTPUT"
+          echo "image_name=${{ steps.derive.outputs.artifact_id }}-image" >> "$GITHUB_OUTPUT"
+
+      - name: Build docker image and push to Artifactory
+        if: ${{ github.event.inputs.operation != 'Deploy' }}
+        id: build_and_push
+        uses: gmail-eng/build-and-push@308a897ba514409179de8046f9baf27fa373b7bc
         with:
-          context: ${{ env.BUILD_PATH }}
-          file: ${{ env.DOCKERFILE_PATH }}
-          push: false
-          load: true
-          tags: |
-            local/${{ steps.derive.outputs.artifact_id }}:${{ steps.derive.outputs.release_version }}
-            local/${{ steps.derive.outputs.artifact_id }}:${{ steps.derive.outputs.release_tag }}
-          provenance: false
+          registry: ${{ steps.build_defaults.outputs.registry }}
+          name: ${{ steps.build_defaults.outputs.image_name }}
+          username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          dockerfile: ${{ steps.build_defaults.outputs.dockerfile_path }}
+          build_path: ${{ steps.build_defaults.outputs.build_path }}
+          build_arg: APP_VERSION=${{ steps.ver.outputs.app_version }}
+          push_to_registry: true
 
-      - name: Compute checksums and image id
-        id: checksums
-        if: ${{ steps.flags.outputs.is_release == 'true' }}
+      - name: Resolve image digest from Artifactory (v2 API)
+        if: ${{ github.event.inputs.operation != 'Deploy' }}
+        id: imagedigest
+        env:
+          REGISTRY: ${{ steps.build_defaults.outputs.registry }}
+          IMAGE: ${{ steps.build_defaults.outputs.image_name }}
+          TAG: ${{ steps.ver.outputs.app_version }}
+          AF_USER: ${{ secrets.ARTIFACTORY_USERNAME }}
+          AF_PASS: ${{ secrets.ARTIFACTORY_PASSWORD }}
         shell: bash
         run: |
           set -euo pipefail
-          IMG="local/${{ steps.derive.outputs.artifact_id }}:${{ steps.derive.outputs.release_version }}"
-          IMAGE_ID="$(docker inspect --format='{{.Id}}' "$IMG")"
-          echo "$IMG@$IMAGE_ID" | tee image-digest.txt
+          HOST="${REGISTRY%%/*}"
+          REPO="${REGISTRY#*/}"
+          URL="https://${HOST}/v2/${REPO}/${IMAGE}/manifests/${TAG}"
+          DIGEST=$(curl -sI -u "${AF_USER}:${AF_PASS}" -H "Accept: application/vnd.docker.distribution.manifest.v2+json" "$URL" | awk '/Docker-Content-Digest/ {print $2}' | tr -d '\r')
+          if [[ -z "$DIGEST" ]]; then
+            echo "::warning::Could not resolve digest from registry; attempting local fallback."
+            if docker inspect "${REGISTRY}/${IMAGE}:${TAG}" >/dev/null 2>&1; then
+              DIGEST=$(docker inspect --format='{{.Id}}' "${REGISTRY}/${IMAGE}:${TAG}") || true
+            fi
+          fi
+          echo "image=${REGISTRY}/${IMAGE}:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "${REGISTRY}/${IMAGE}:${TAG}@${DIGEST}" | tee image-digest.txt
+
+      # ---------- Release-only: checksums, GitHub Release, Maven deploy to prod ----------
+      - name: Compute artifact SHA256
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: |
           sha256sum "${{ steps.artifact.outputs.artifact_path }}" | tee tar-sha256.txt
-          echo "image=$IMG" >> "$GITHUB_OUTPUT"
-          echo "digest=$IMAGE_ID" >> "$GITHUB_OUTPUT"
-          jq -n --arg artifactId "${{ steps.derive.outputs.artifact_id }}" \
-                --arg version "${{ steps.derive.outputs.release_version }}" \
-                --arg commit "${GITHUB_SHA}" \
-                --arg image "$IMG" \
-                --arg imageId "$IMAGE_ID" \
-                --arg artifactPath "${{ steps.artifact.outputs.artifact_path }}" \
-                --arg buildTime "$(date -u +%FT%TZ)" \
-                '{artifactId:$artifactId, version:$version, commit:$commit, image:$image, imageId:$imageId, artifact:$artifactPath, built_at:$buildTime}' \
-            > release.json
 
       - name: Create GitHub Release with assets
         if: ${{ steps.flags.outputs.is_release == 'true' }}
@@ -248,13 +277,13 @@ jobs:
           body: |
             Automated release **${{ steps.derive.outputs.release_tag }}**
 
-            Local image reference + ID:
+            Image (tag + digest):
             ```
-            ${{ steps.checksums.outputs.image }}@${{ steps.checksums.outputs.digest }}
+            ${{ steps.imagedigest.outputs.image }}@${{ steps.imagedigest.outputs.digest }}
             ```
 
             Artifact checksum (SHA256) attached in `tar-sha256.txt`.
-            Machine-readable metadata in `release.json`.
+            Machine-readable metadata in `release.json` (below).
           files: |
             ${{ steps.artifact.outputs.artifact_path }}
             image-digest.txt
@@ -280,6 +309,17 @@ jobs:
           G='${{ steps.derive.outputs.group_id }}'
           A='${{ steps.derive.outputs.artifact_id }}'
           V='${{ steps.derive.outputs.release_version }}'
+
+          # Make a compact release.json using known values
+          jq -n --arg artifactId "$A" \
+                --arg version "$V" \
+                --arg commit "${GITHUB_SHA}" \
+                --arg image "${{ steps.imagedigest.outputs.image }}" \
+                --arg digest "${{ steps.imagedigest.outputs.digest }}" \
+                --arg artifactPath "$FILE" \
+                --arg buildTime "$(date -u +%FT%TZ)" \
+                '{artifactId:$artifactId, version:$version, commit:$commit, image:$image, digest:$digest, artifact:$artifactPath, built_at:$buildTime}' \
+            > release.json
 
           mvn -B -s "${MAVEN_SETTINGS_FILE}" deploy:deploy-file \
             -DrepositoryId="${RID}" -Durl="${RURL}" \
