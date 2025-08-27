@@ -43,27 +43,27 @@ jobs:
       BUILD_PATH: .
 
     steps:
-      - name: "Checkout"
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: "Setup Java & Maven"
+      - name: Setup Java and Maven
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
-      - name: "Setup Maven"
+      - name: Setup Maven
         uses: stCarolas/setup-maven@v4.5
         with:
           maven-version: 3.9.9
 
-      - name: "Install tools (xmllint, jq)"
+      - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y libxml2-utils jq
 
-      - name: "Derive artifactId/version"
+      - name: Derive artifactId and version
         id: derive
         shell: bash
         run: |
@@ -81,7 +81,7 @@ jobs:
             echo "release_tag=$RELEASE_TAG"
           } >> "$GITHUB_OUTPUT"
 
-      - name: "Decide mode"
+      - name: Decide mode
         id: flags
         shell: bash
         run: |
@@ -94,11 +94,12 @@ jobs:
           fi
 
       # ---------- Build only ----------
-      - name: "Build (snapshot)"
+      - name: Build snapshot
         if: ${{ steps.flags.outputs.op == 'Build only' }}
-        run: mvn -q -DskipTests -U clean package
+        run: |
+          mvn -q -DskipTests -U clean package
 
-      - name: "Upload build artifact (snapshot)"
+      - name: Upload build artifact (snapshot)
         if: ${{ steps.flags.outputs.op == 'Build only' }}
         uses: actions/upload-artifact@v4
         with:
@@ -107,12 +108,12 @@ jobs:
           if-no-files-found: error
 
       # ---------- Build & Deploy (release) ----------
-      - name: "Guard: branch must be main"
+      - name: Guard - branch must be main
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: |
           test "${GITHUB_REF_NAME}" = "main" || { echo "::error::Releases only from main"; exit 1; }
 
-      - name: "Guard: POM must be *-SNAPSHOT before release"
+      - name: Guard - POM must be *-SNAPSHOT before release
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: |
           case "${{ steps.derive.outputs.raw_version }}" in
@@ -120,14 +121,14 @@ jobs:
             *) echo "::error::raw_version must end with -SNAPSHOT; found ${{ steps.derive.outputs.raw_version }}"; exit 1 ;;
           esac
 
-      - name: "Guard: tag must not already exist"
+      - name: Guard - tag must not already exist
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: |
           if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.derive.outputs.release_tag }}" >/dev/null 2>&1; then
             echo "::error::Tag ${{ steps.derive.outputs.release_tag }} already exists"; exit 1
           fi
 
-      - name: "Set version to RELEASE and commit"
+      - name: Set version to RELEASE and commit
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: |
           mvn -B versions:set -DnewVersion='${{ steps.derive.outputs.release_version }}'
@@ -137,18 +138,19 @@ jobs:
           git add pom.xml
           git commit -m "Release ${{ steps.derive.outputs.artifact_id }} ${{ steps.derive.outputs.release_version }}" || echo "No changes to commit"
 
-      - name: "Create & push annotated tag"
+      - name: Create and push annotated tag
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: |
           git tag -a "${{ steps.derive.outputs.release_tag }}" -m "Release ${{ steps.derive.outputs.release_tag }}"
           git push origin "${GITHUB_REF_NAME}"
           git push origin "${{ steps.derive.outputs.release_tag }}"
 
-      - name: "Build (release)"
+      - name: Build release
         if: ${{ steps.flags.outputs.is_release == 'true' }}
-        run: mvn -q -DskipTests -U clean package
+        run: |
+          mvn -q -DskipTests -U clean package
 
-      - name: "Locate artifact (tar preferred, jar fallback)"
+      - name: Locate artifact (prefer .tar.gz, fallback .jar)
         id: artifact
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         shell: bash
@@ -166,11 +168,11 @@ jobs:
           fi
           echo "::error::Neither $BASE_TAR nor $BASE_JAR found under */target/*"; exit 1
 
-      - name: "Set up Docker Buildx"
+      - name: Set up Docker Buildx
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         uses: docker/setup-buildx-action@v3
 
-      - name: "Build local image (no push)"
+      - name: Build local image (no push)
         id: docker_local
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         uses: docker/build-push-action@v6
@@ -184,7 +186,7 @@ jobs:
             local/${{ steps.derive.outputs.artifact_id }}:${{ steps.derive.outputs.release_tag }}
           provenance: false
 
-      - name: "Compute checksums (local image ID + tar/jar sha256)"
+      - name: Compute checksums and image id
         id: checksums
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         shell: bash
@@ -194,7 +196,7 @@ jobs:
           IMAGE_ID="$(docker inspect --format='{{.Id}}' "$IMG")"
           echo "$IMG@$IMAGE_ID" | tee image-digest.txt
           sha256sum "${{ steps.artifact.outputs.artifact_path }}" | tee tar-sha256.txt
-          echo "image=$IMG"   >> "$GITHUB_OUTPUT"
+          echo "image=$IMG" >> "$GITHUB_OUTPUT"
           echo "digest=$IMAGE_ID" >> "$GITHUB_OUTPUT"
           jq -n --arg artifactId "${{ steps.derive.outputs.artifact_id }}" \
                 --arg version "${{ steps.derive.outputs.release_version }}" \
@@ -206,7 +208,7 @@ jobs:
                 '{artifactId:$artifactId, version:$version, commit:$commit, image:$image, imageId:$imageId, artifact:$artifactPath, built_at:$buildTime}' \
             > release.json
 
-      - name: "Create GitHub Release (attach tar/jar + checksums + metadata)"
+      - name: Create GitHub Release
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
@@ -220,7 +222,7 @@ jobs:
             ${{ steps.checksums.outputs.image }}@${{ steps.checksums.outputs.digest }}
             ```
 
-            **Artifact checksum (SHA256)** attached in `tar-sha256.txt`.  
+            Artifact checksum (SHA256) attached in `tar-sha256.txt`.
             Machine-readable metadata in `release.json`.
           files: |
             ${{ steps.artifact.outputs.artifact_path }}
@@ -228,7 +230,7 @@ jobs:
             tar-sha256.txt
             release.json
 
-      - name: "Bump to next -SNAPSHOT and push"
+      - name: Bump to next -SNAPSHOT and push
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: |
           mvn -B versions:set -DnewVersion='${{ steps.derive.outputs.next_version }}'
@@ -252,14 +254,15 @@ jobs:
       digest: ${{ steps.extract.outputs.digest }}
       version: ${{ steps.extract.outputs.version }}
     steps:
-      - name: "Guard: release_tag provided"
+      - name: Guard - release_tag provided
         run: |
           test -n "${{ github.event.inputs.release_tag }}" || { echo "::error::Please provide input release_tag"; exit 1; }
 
-      - name: "Install jq"
-        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Install jq
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq
 
-      - name: "Download release assets"
+      - name: Download release assets
         uses: robinraju/release-downloader@v1
         with:
           tag: ${{ github.event.inputs.release_tag }}
@@ -270,7 +273,7 @@ jobs:
           tarBall: false
           zipBall: false
 
-      - name: "Extract image + digest from assets"
+      - name: Extract image and digest from assets
         id: extract
         shell: bash
         run: |
@@ -295,39 +298,36 @@ jobs:
     needs: [fetch_release]
     runs-on: ubuntu-latest
     steps:
-      - name: "Gate: ensure image matches release (e1)"
-        shell: bash
+      - name: Gate - ensure image matches release (e1)
         run: |
-          set -euo pipefail
           echo "e1 will deploy: ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
-      - name: "Deploy to e1 (dummy)"
-        run: echo "Pretend deploy e1 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
+      - name: Deploy to e1 (dummy)
+        run: |
+          echo "Pretend deploy e1 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
 
   deploy_e2:
     if: ${{ github.event.inputs.operation == 'Deploy' && (github.event.inputs.manual_env == 'e2' || github.event.inputs.manual_env == 'e3') }}
     needs: [fetch_release, deploy_e1]
     runs-on: ubuntu-latest
     steps:
-      - name: "Gate: ensure image matches release (e2)"
-        shell: bash
+      - name: Gate - ensure image matches release (e2)
         run: |
-          set -euo pipefail
           echo "e2 will deploy: ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
-      - name: "Deploy to e2 (dummy)"
-        run: echo "Pretend deploy e2 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
+      - name: Deploy to e2 (dummy)
+        run: |
+          echo "Pretend deploy e2 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
 
   deploy_e3:
     if: ${{ github.event.inputs.operation == 'Deploy' && github.event.inputs.manual_env == 'e3' }}
     needs: [fetch_release, deploy_e2]
     runs-on: ubuntu-latest
     steps:
-      - name: "Gate: ensure image matches release (e3)"
-        shell: bash
+      - name: Gate - ensure image matches release (e3)
         run: |
-          set -euo pipefail
           echo "e3 will deploy: ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
-      - name: "Deploy to e3 (dummy)"
-        run: echo "Pretend deploy e3 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
+      - name: Deploy to e3 (dummy)
+        run: |
+          echo "Pretend deploy e3 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
 
   # ===========================================
   # BUILD-&-DEPLOY PATH (same run, after build)
@@ -337,27 +337,33 @@ jobs:
     needs: [pipeline]
     runs-on: ubuntu-latest
     steps:
-      - name: "Gate: ensure image from build (e1)"
-        run: echo "e1 will deploy: ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
-      - name: "Deploy to e1 (dummy)"
-        run: echo "Pretend deploy e1 with ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+      - name: Gate - ensure image from build (e1)
+        run: |
+          echo "e1 will deploy: ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+      - name: Deploy to e1 (dummy)
+        run: |
+          echo "Pretend deploy e1 with ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
 
   bd_deploy_e2:
     if: ${{ github.event.inputs.operation == 'Build & Deploy' && (github.event.inputs.manual_env == 'e2' || github.event.inputs.manual_env == 'e3') }}
     needs: [pipeline, bd_deploy_e1]
     runs-on: ubuntu-latest
     steps:
-      - name: "Gate: ensure image from build (e2)"
-        run: echo "e2 will deploy: ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
-      - name: "Deploy to e2 (dummy)"
-        run: echo "Pretend deploy e2 with ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+      - name: Gate - ensure image from build (e2)
+        run: |
+          echo "e2 will deploy: ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+      - name: Deploy to e2 (dummy)
+        run: |
+          echo "Pretend deploy e2 with ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
 
   bd_deploy_e3:
     if: ${{ github.event.inputs.operation == 'Build & Deploy' && github.event.inputs.manual_env == 'e3' }}
     needs: [pipeline, bd_deploy_e2]
     runs-on: ubuntu-latest
     steps:
-      - name: "Gate: ensure image from build (e3)"
-        run: echo "e3 will deploy: ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
-      - name: "Deploy to e3 (dummy)"
-        run: echo "Pretend deploy e3 with ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+      - name: Gate - ensure image from build (e3)
+        run: |
+          echo "e3 will deploy: ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+      - name: Deploy to e3 (dummy)
+        run: |
+          echo "Pretend deploy e3 with ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
