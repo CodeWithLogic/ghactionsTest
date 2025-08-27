@@ -10,7 +10,7 @@
 	</parent>
 	<groupId>com.servicing.ghactions</groupId>
 	<artifactId>productservice</artifactId>
-	<version>1.0.3-SNAPSHOT</version>
+	<version>1.0.3</version>
 	<name>GHActions</name>
 	<description>Api Gateway</description>
 	<url/>
