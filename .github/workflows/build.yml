@@ -94,6 +94,11 @@ jobs:
         run: |
           chmod +x ./mvnw || true
           ./mvnw -q -DskipTests -U clean package
+		  
+	  - name: Inspect build outputs
+	    run: |
+		  ls -la target || true
+		  find . -type f -name "*.tar.gz" -o -name "*.jar"
 
       - name: Upload artifact for release version (GH Artifact)
         if: ${{ steps.flags.outputs.is_release == 'true' }}
