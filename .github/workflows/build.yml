@@ -101,7 +101,7 @@ jobs:
           if-no-files-found: error
 
       # -------------------- Deploy only --------------------
-      - name: Guard: release_tag provided
+      - name: "Guard: release_tag provided"
         if: ${{ steps.flags.outputs.is_deploy_only == 'true' }}
         run: |
           test -n "${{ github.event.inputs.release_tag }}" || { echo "::error::Please provide input release_tag"; exit 1; }
@@ -130,12 +130,12 @@ jobs:
 
       # -------------------- Build & Deploy (release) --------------------
       # Guardrails
-      - name: Guard: branch must be main
+      - name: "Guard: branch must be main"
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: |
           test "${GITHUB_REF_NAME}" = "main" || { echo "::error::Releases only from main"; exit 1; }
 
-      - name: Guard: POM must be *-SNAPSHOT before release
+      - name: "Guard: POM must be *-SNAPSHOT before release"
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: |
           case "${{ steps.derive.outputs.raw_version }}" in
@@ -143,14 +143,14 @@ jobs:
             *) echo "::error::raw_version must end with -SNAPSHOT; found ${{ steps.derive.outputs.raw_version }}"; exit 1 ;;
           esac
 
-      - name: Guard: tag must not already exist
+      - name: "Guard: tag must not already exist"
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: |
           if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.derive.outputs.release_tag }}" >/dev/null 2>&1; then
             echo "::error::Tag ${{ steps.derive.outputs.release_tag }} already exists"; exit 1
           fi
 
-      - name: Guard: human confirmation of tag
+      - name: "Guard: human confirmation of tag"
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: |
           EXPECT="${{ steps.derive.outputs.release_tag }}"
@@ -211,8 +211,8 @@ jobs:
         with:
           context: ${{ env.BUILD_PATH }}
           file: ${{ env.DOCKERFILE_PATH }}
-          push: false         # <-- no registry push
-          load: true          # load into docker engine
+          push: false
+          load: true
           tags: |
             local/${{ steps.derive.outputs.artifact_id }}:${{ steps.derive.outputs.release_version }}
             local/${{ steps.derive.outputs.artifact_id }}:${{ steps.derive.outputs.release_tag }}
@@ -225,7 +225,6 @@ jobs:
         run: |
           set -euo pipefail
           IMG="local/${{ steps.derive.outputs.artifact_id }}:${{ steps.derive.outputs.release_version }}"
-          # Local image content-addressable ID (sha256:...)
           IMAGE_ID="$(docker inspect --format='{{.Id}}' "$IMG")"
           echo "$IMG@$IMAGE_ID" | tee image-digest.txt
           sha256sum "${{ steps.artifact.outputs.artifact_path }}" | tee tar-sha256.txt
