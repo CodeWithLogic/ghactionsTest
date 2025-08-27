@@ -1,27 +1,34 @@
-name: Maven Build
+name: Build / Release
 
 on:
   workflow_dispatch:
     inputs:
-      manual_op:
-        description: "Operation to perform"
+      operation:
+        description: "Choose operation"
         required: true
         type: choice
         options:
           - "Build only"
-          - "Deploy an image"
+          - "Build & Deploy"
+          - "Deploy only"
         default: "Build only"
+      confirm_tag:
+        description: "[Build & Deploy only] Paste exact tag (e.g., productservice-1.0.0)"
+        required: false
+      release_tag:
+        description: "[Deploy only] Existing release tag to use (e.g., productservice-1.0.0)"
+        required: false
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  build_push:
-    name: "Build & Push (artifacts + docker + uploads)"
+  pipeline:
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
-      ART_URL: https://artifactory.gmail.com
-      GENERIC_REPO: generic-releases-local
-      ARTIFACTORY_REGISTRY: artifactory.gmail.com/paas-registry
       DOCKERFILE_PATH: Dockerfile
       BUILD_PATH: .
 
@@ -31,42 +38,29 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Compute image name from repo
-        id: imgname
-        shell: bash
-        run: |
-          REPO="${GITHUB_REPOSITORY##*/}"
-          echo "IMAGE_NAME=${REPO}-image" >> "$GITHUB_ENV"
-          echo "image_name=${REPO}-image" >> "$GITHUB_OUTPUT"
-
-      - name: Set up JDK
+      - name: Setup Java & Maven
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
-
-      - name: Set up Maven
-        uses: stCarolas/setup-maven@v4.5
+      - uses: stCarolas/setup-maven@v4.5
         with:
           maven-version: 3.9.9
 
-      - name: Install xmllint
-        run: sudo apt-get update && sudo apt-get install -y libxml2-utils
+      - name: Install tools (xmllint, jq)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxml2-utils jq
 
-      - name: Extract artifactId/version & compute tags
+      - name: Derive artifactId/version
         id: derive
         shell: bash
         run: |
           set -euo pipefail
           ARTIFACT_ID=$(xmllint --xpath "//*[local-name()='project']/*[local-name()='artifactId']/text()" pom.xml)
-          RAW_VERSION=$(xmllint --xpath "//*[local-name()='project']/*[local-name()='version']/text()" pom.xml 2>/dev/null || true)
-          if [[ -z "${RAW_VERSION:-}" ]]; then
-            echo "Could not read <version> from pom.xml"; exit 1
-          fi
+          RAW_VERSION=$(xmllint --xpath "//*[local-name()='project']/*[local-name()='version']/text()" pom.xml)
           RELEASE_VERSION="${RAW_VERSION%-SNAPSHOT}"
-          IFS='.' read -r MAJ MIN PAT <<< "${RELEASE_VERSION}"
-          PAT=${PAT:-0}; PAT=$((PAT+1))
-          NEXT_VERSION="${MAJ}.${MIN}.${PAT}-SNAPSHOT"
+          IFS='.' read -r MAJ MIN PAT <<< "${RELEASE_VERSION}"; PAT=${PAT:-0}; NEXT_VERSION="${MAJ}.${MIN}.$((PAT+1))-SNAPSHOT"
           RELEASE_TAG="${ARTIFACT_ID}-${RELEASE_VERSION}"
           {
             echo "artifact_id=$ARTIFACT_ID"
@@ -76,35 +70,118 @@ jobs:
             echo "release_tag=$RELEASE_TAG"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Decide if this is a RELEASE run
+      - name: Decide mode
         id: flags
         shell: bash
         run: |
-          if [[ "${GITHUB_REF_NAME}" == "main" && "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.manual_op }}" == "Deploy an image" ]]; then
+          OP="${{ github.event.inputs.operation }}"
+          echo "op=$OP" >> "$GITHUB_OUTPUT"
+          if [[ "$OP" == "Build & Deploy" ]]; then
             echo "is_release=true" >> "$GITHUB_OUTPUT"
           else
             echo "is_release=false" >> "$GITHUB_OUTPUT"
           fi
+          if [[ "$OP" == "Deploy only" ]]; then
+            echo "is_deploy_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_deploy_only=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Update version to RELEASE (only on release)
+      # -------------------- Build only --------------------
+      - name: Build (snapshot)
+        if: ${{ steps.flags.outputs.op == 'Build only' }}
+        run: mvn -q -DskipTests -U clean package
+
+      - name: Upload build artifact (snapshot)
+        if: ${{ steps.flags.outputs.op == 'Build only' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.derive.outputs.artifact_id }}-${{ steps.derive.outputs.raw_version }}-build-${{ github.run_number }}
+          path: "**/target/*"
+          if-no-files-found: error
+
+      # -------------------- Deploy only --------------------
+      - name: Guard: release_tag provided
+        if: ${{ steps.flags.outputs.is_deploy_only == 'true' }}
+        run: |
+          test -n "${{ github.event.inputs.release_tag }}" || { echo "::error::Please provide input release_tag"; exit 1; }
+
+      - name: Download release assets (image digest/id + checksum)
+        if: ${{ steps.flags.outputs.is_deploy_only == 'true' }}
+        uses: robinraju/release-downloader@v1
+        with:
+          tag: ${{ github.event.inputs.release_tag }}
+          fileName: |
+            image-digest.txt
+            tar-sha256.txt
+            release.json
+          tarBall: false
+          zipBall: false
+
+      - name: Show digest/id for deploy team
+        if: ${{ steps.flags.outputs.is_deploy_only == 'true' }}
+        run: |
+          echo "===== image-digest.txt ====="
+          cat image-digest.txt || true
+          echo "===== tar-sha256.txt ====="
+          cat tar-sha256.txt || true
+          echo "===== release.json ====="
+          cat release.json || true
+
+      # -------------------- Build & Deploy (release) --------------------
+      # Guardrails
+      - name: Guard: branch must be main
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: |
+          test "${GITHUB_REF_NAME}" = "main" || { echo "::error::Releases only from main"; exit 1; }
+
+      - name: Guard: POM must be *-SNAPSHOT before release
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: |
+          case "${{ steps.derive.outputs.raw_version }}" in
+            *-SNAPSHOT) : ;;
+            *) echo "::error::raw_version must end with -SNAPSHOT; found ${{ steps.derive.outputs.raw_version }}"; exit 1 ;;
+          esac
+
+      - name: Guard: tag must not already exist
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.derive.outputs.release_tag }}" >/dev/null 2>&1; then
+            echo "::error::Tag ${{ steps.derive.outputs.release_tag }} already exists"; exit 1
+          fi
+
+      - name: Guard: human confirmation of tag
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: |
+          EXPECT="${{ steps.derive.outputs.release_tag }}"
+          CONF="${{ github.event.inputs.confirm_tag }}"
+          [[ -n "$CONF" ]] || { echo "::error::Provide confirm_tag=${EXPECT}"; exit 1; }
+          [[ "$CONF" == "$EXPECT" ]] || { echo "::error::confirm_tag mismatch: got '$CONF', expected '$EXPECT'"; exit 1; }
+
+      # Release: set version -> commit -> tag
+      - name: Set version to RELEASE and commit
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: |
           mvn -B versions:set -DnewVersion='${{ steps.derive.outputs.release_version }}'
           mvn -B versions:commit
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add pom.xml
+          git commit -m "Release ${{ steps.derive.outputs.artifact_id }} ${{ steps.derive.outputs.release_version }}" || echo "No changes to commit"
 
-      - name: Build with Maven (produces .tar.gz under target/)
+      - name: Create & push annotated tag
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: |
-          mvn -q -DskipTests -U clean package
+          git tag -a "${{ steps.derive.outputs.release_tag }}" -m "Release ${{ steps.derive.outputs.release_tag }}"
+          git push origin "${GITHUB_REF_NAME}"
+          git push origin "${{ steps.derive.outputs.release_tag }}"
 
-      - name: Inspect build outputs
-        run: |
-          pwd
-          echo "---- list targets ----"
-          find . -type d -name target -maxdepth 3 -print
-          echo "---- find tar/jar ----"
-          find . -type f -path "*/target/*" \( -name "*.tar.gz" -o -name "*.jar" \) | sed -n '1,200p'
+      # Build once
+      - name: Build (release)
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: mvn -q -DskipTests -U clean package
 
-      - name: Locate artifact file (tar preferred, jar fallback)
+      - name: Locate artifact (tar preferred, jar fallback)
         id: artifact
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         shell: bash
@@ -114,28 +191,80 @@ jobs:
           BASE_JAR="${{ steps.derive.outputs.artifact_id }}-${{ steps.derive.outputs.release_version }}.jar"
           TAR_PATH="$(find . -type f -path '*/target/*' -name "$BASE_TAR" | head -n 1 || true)"
           if [[ -n "$TAR_PATH" ]]; then
-            echo "artifact_path=$TAR_PATH" >> "$GITHUB_OUTPUT"
-            echo "artifact_name=${{ steps.derive.outputs.artifact_id }}-${{ steps.derive.outputs.release_version }}" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "artifact_path=$TAR_PATH" >> "$GITHUB_OUTPUT"; exit 0
           fi
           JAR_PATH="$(find . -type f -path '*/target/*' -name "$BASE_JAR" | head -n 1 || true)"
           if [[ -n "$JAR_PATH" ]]; then
-            echo "artifact_path=$JAR_PATH" >> "$GITHUB_OUTPUT"
-            echo "artifact_name=${{ steps.derive.outputs.artifact_id }}-${{ steps.derive.outputs.release_version }}" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "artifact_path=$JAR_PATH" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          echo "::error::Could not find either $BASE_TAR or $BASE_JAR under any */target/*"
-          exit 1
+          echo "::error::Neither $BASE_TAR nor $BASE_JAR found under */target/*"; exit 1
 
-      - name: Upload release artifact
+      # ---- Build Docker image LOCALLY (no registry, no creds) ----
+      - name: Set up Docker Buildx
         if: ${{ steps.flags.outputs.is_release == 'true' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.artifact.outputs.artifact_name }}
-          path: ${{ steps.artifact.outputs.artifact_path }}
-          if-no-files-found: error
+        uses: docker/setup-buildx-action@v3
 
-      - name: Bump version to NEXT -SNAPSHOT (and push)
+      - name: Build local image (no push)
+        id: docker_local
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.BUILD_PATH }}
+          file: ${{ env.DOCKERFILE_PATH }}
+          push: false         # <-- no registry push
+          load: true          # load into docker engine
+          tags: |
+            local/${{ steps.derive.outputs.artifact_id }}:${{ steps.derive.outputs.release_version }}
+            local/${{ steps.derive.outputs.artifact_id }}:${{ steps.derive.outputs.release_tag }}
+          provenance: false
+
+      - name: Compute checksums (local image ID + tar/jar sha256)
+        id: checksums
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="local/${{ steps.derive.outputs.artifact_id }}:${{ steps.derive.outputs.release_version }}"
+          # Local image content-addressable ID (sha256:...)
+          IMAGE_ID="$(docker inspect --format='{{.Id}}' "$IMG")"
+          echo "$IMG@$IMAGE_ID" | tee image-digest.txt
+          sha256sum "${{ steps.artifact.outputs.artifact_path }}" | tee tar-sha256.txt
+          jq -n --arg artifactId "${{ steps.derive.outputs.artifact_id }}" \
+                --arg version "${{ steps.derive.outputs.release_version }}" \
+                --arg commit "${GITHUB_SHA}" \
+                --arg image "$IMG" \
+                --arg imageId "$IMAGE_ID" \
+                --arg artifactPath "${{ steps.artifact.outputs.artifact_path }}" \
+                --arg buildTime "$(date -u +%FT%TZ)" \
+                '{artifactId:$artifactId, version:$version, commit:$commit, image:$image, imageId:$imageId, artifact:$artifactPath, built_at:$buildTime}' \
+            > release.json
+
+      - name: Create GitHub Release (attach tar/jar + checksums + metadata)
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.derive.outputs.release_tag }}
+          name: ${{ steps.derive.outputs.release_tag }}
+          body: |
+            Automated release **${{ steps.derive.outputs.release_tag }}**
+
+            **Docker image (local build; no registry push in this test pipeline)**  
+            Local image reference + ID:
+            ```
+            local/${{ steps.derive.outputs.artifact_id }}:${{ steps.derive.outputs.release_version }}@$(cat image-digest.txt | cut -d@ -f2)
+            ```
+
+            > Note: For production, switch to pushing the image to your registry and publish the remote digest here.
+
+            **Artifact checksum (SHA256)** is attached in `tar-sha256.txt`.  
+            Machine-readable metadata is in `release.json`.
+          files: |
+            ${{ steps.artifact.outputs.artifact_path }}
+            image-digest.txt
+            tar-sha256.txt
+            release.json
+
+      - name: Bump to next -SNAPSHOT and push
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         run: |
           mvn -B versions:set -DnewVersion='${{ steps.derive.outputs.next_version }}'
@@ -144,9 +273,9 @@ jobs:
           git config user.email "actions@github.com"
           git add pom.xml
           git commit -m "Bump version to ${{ steps.derive.outputs.next_version }}" || echo "No changes"
-          git push origin "${{ github.ref_name }}"
+          git push origin "${GITHUB_REF_NAME}"
 
-      - name: Print summary
+      - name: Summary
         run: |
-          echo "Released Version: ${{ steps.derive.outputs.release_version }}"
-          echo "Release Tag:      ${{ steps.derive.outputs.release_tag }}"
+          echo "operation = ${{ steps.flags.outputs.op }}"
+          echo "release_tag = ${{ steps.derive.outputs.release_tag }}"
