@@ -189,7 +189,7 @@ jobs:
           echo "Listing candidate artifacts under */target/*:"
           find . -type f -path "*/target/*" \( -name "*.tar.gz" -o -name "*.jar" \) -print
 
-      - name: Locate artifact (robust: prefers tar.gz, then jar)
+      - name: "Locate artifact (robust: prefers tar.gz, then jar)"
         id: artifact
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         shell: bash
