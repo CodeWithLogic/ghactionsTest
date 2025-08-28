@@ -251,7 +251,7 @@ jobs:
         run: |
           set -euo pipefail
           IMAGE="${{ steps.build_defaults.outputs.registry }}/${{ steps.build_defaults.outputs.image_name }}:${{ steps.ver.outputs.app_version }}"
-          SHA="${{ steps.build_and_pus h.outputs.sha256 }}"
+          SHA="${{ steps.build_and_push.outputs.sha256 }}"
           if [[ -z "$SHA" ]]; then
             echo "::error::build-and-push action did not return sha256 output"; exit 1
           fi
