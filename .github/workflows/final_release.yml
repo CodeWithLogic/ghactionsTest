@@ -1,4 +1,4 @@
-name: Final Release
+name: Release
 
 on:
   workflow_dispatch:
@@ -34,14 +34,14 @@ jobs:
     permissions:
       contents: write
     outputs:
-      image: ${{ steps.imagedigest.outputs.image }}
-      digest: ${{ steps.imagedigest.outputs.digest }}
+      image: ${{ steps.imgmeta.outputs.image }}
+      digest: ${{ steps.imgmeta.outputs.digest }}
       release_tag: ${{ steps.derive.outputs.release_tag }}
       version: ${{ steps.derive.outputs.release_version }}
     env:
       DOCKERFILE_PATH: Dockerfile
       BUILD_PATH: .
-      MAVEN_SETTINGS_FILE: settings.xml
+      MAVEN_SETTINGS_FILE: ${{ github.workspace }}/settings.xml
       ARTIFACTORY_USERNAME: ${{ secrets.ARTIFACTORY_USERNAME }}
       ARTIFACTORY_PASSWORD: ${{ secrets.ARTIFACTORY_PASSWORD }}
 
@@ -86,7 +86,7 @@ jobs:
           RELEASE_TAG="${ARTIFACT_ID}-${RELEASE_VERSION}"
 
           SNAP_ID=$(xmllint --xpath "string(/*[local-name()='project']/*[local-name()='distributionManagement']/*[local-name()='snapshotRepository']/*[local-name()='id'])" pom.xml 2>/dev/null || true)
-          SNAP_URL=$(xmllint --xpath "string(/*[local-name']=='project']/*[local-name()='distributionManagement']/*[local-name()='snapshotRepository']/*[local-name()='url'])" pom.xml 2>/dev/null || true)
+          SNAP_URL=$(xmllint --xpath "string(/*[local-name()='project']/*[local-name()='distributionManagement']/*[local-name()='snapshotRepository']/*[local-name()='url'])" pom.xml 2>/dev/null || true)
           REL_ID=$(xmllint --xpath "string(/*[local-name()='project']/*[local-name()='distributionManagement']/*[local-name()='repository']/*[local-name()='id'])" pom.xml 2>/dev/null || true)
           REL_URL=$(xmllint --xpath "string(/*[local-name()='project']/*[local-name()='distributionManagement']/*[local-name()='repository']/*[local-name()='url'])" pom.xml 2>/dev/null || true)
 
@@ -225,7 +225,7 @@ jobs:
         if: ${{ github.event.inputs.operation != 'Deploy' }}
         id: build_defaults
         run: |
-          echo "registry=artifactory.gmail.com/paas-registry" >> "$GITHUB_OUTPUT"
+          echo "registry=artifactory.gmail.com/pass-registry" >> "$GITHUB_OUTPUT"
           echo "dockerfile_path=${{ env.DOCKERFILE_PATH }}" >> "$GITHUB_OUTPUT"
           echo "build_path=${{ env.BUILD_PATH }}" >> "$GITHUB_OUTPUT"
           echo "image_name=${{ steps.derive.outputs.artifact_id }}" >> "$GITHUB_OUTPUT"
@@ -244,51 +244,25 @@ jobs:
           build_arg: APP_VERSION=${{ steps.ver.outputs.app_version }}
           push_to_registry: true
 
-      - name: Docker login for digest lookup
+      - name: Compose image ref & normalize digest from build output
         if: ${{ github.event.inputs.operation != 'Deploy' }}
-        uses: docker/login-action@v3
-        with:
-          registry: artifactory.gmail.com
-          username: ${{ secrets.ARTIFACTORY_USERNAME }}
-          password: ${{ secrets.ARTIFACTORY_PASSWORD }}
-
-      - name: Resolve image digest from Artifactory (clean image ref)
-        if: ${{ github.event.inputs.operation != 'Deploy' }}
-        id: imagedigest
-        env:
-          REGISTRY: ${{ steps.build_defaults.outputs.registry }}
-          IMAGE:    ${{ steps.build_defaults.outputs.image_name }}
-          TAG:      ${{ steps.ver.outputs.app_version }}
-          AF_USER:  ${{ secrets.ARTIFACTORY_USERNAME }}
-          AF_PASS:  ${{ secrets.ARTIFACTORY_PASSWORD }}
+        id: imgmeta
         shell: bash
         run: |
           set -euo pipefail
-          REG="${REGISTRY#https://}"; REG="${REG#http://}"
-          HOST="${REG%%/*}"; REPO="${REG#*/}"
-          IMAGE_REF="${REG}/${IMAGE}:${TAG}"
-
-          URL="https://${HOST}/v2/${REPO}/${IMAGE}/manifests/${TAG}"
-          DIGEST=$(curl -sI -u "${AF_USER}:${AF_PASS}" \
-                   -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
-                   "$URL" | awk '/Docker-Content-Digest/ {print $2}' | tr -d '\r')
-
-          IMGID=""
-          if [[ -z "$DIGEST" ]]; then
-            if docker inspect "${IMAGE_REF}" >/dev/null 2>&1; then
-              IMGID=$(docker inspect --format='{{.Id}}' "${IMAGE_REF}" || true)
-            fi
+          IMAGE="${{ steps.build_defaults.outputs.registry }}/${{ steps.build_defaults.outputs.image_name }}:${{ steps.ver.outputs.app_version }}"
+          SHA="${{ steps.build_and_pus h.outputs.sha256 }}"
+          if [[ -z "$SHA" ]]; then
+            echo "::error::build-and-push action did not return sha256 output"; exit 1
           fi
-
-          echo "image=${IMAGE_REF}"   >> "$GITHUB_OUTPUT"
-          echo "digest=${DIGEST}"     >> "$GITHUB_OUTPUT"
-          echo "imageId=${IMGID}"     >> "$GITHUB_OUTPUT"
-
-          if [[ -n "$DIGEST" ]]; then
-            echo "${IMAGE_REF}@${DIGEST}" | tee image-digest.txt
+          if [[ "$SHA" == sha256:* ]]; then
+            DIGEST="$SHA"
           else
-            echo "${IMAGE_REF}@${IMGID:-<digest-unresolved>}" | tee image-digest.txt
+            DIGEST="sha256:$SHA"
           fi
+          echo "image=$IMAGE"   >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "${IMAGE}@${DIGEST}" | tee image-digest.txt
 
       # ---------- Release-only: checksums, metadata, GH Release, Maven deploy to prod ----------
       - name: Compute artifact SHA256
@@ -301,6 +275,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          [[ -n "${{ steps.imgmeta.outputs.digest }}" ]] || { echo "::error::No digest; aborting release metadata"; exit 1; }
           ART_PATH="${{ steps.artifact.outputs.artifact_path }}"
           case "$ART_PATH" in (./*) :;; (*) ART_PATH="./$ART_PATH";; esac
 
@@ -308,9 +283,8 @@ jobs:
             --arg artifactId "${{ steps.derive.outputs.artifact_id }}" \
             --arg version    "${{ steps.derive.outputs.release_version }}" \
             --arg commit     "${GITHUB_SHA}" \
-            --arg image      "${{ steps.imagedigest.outputs.image }}" \
-            --arg digest     "${{ steps.imagedigest.outputs.digest }}" \
-            --arg imageId    "${{ steps.imagedigest.outputs.imageId }}" \
+            --arg image      "${{ steps.imgmeta.outputs.image }}" \
+            --arg digest     "${{ steps.imgmeta.outputs.digest }}" \
             --arg artifact   "$ART_PATH" \
             --arg built_at   "$(date -u +%FT%TZ)" \
             '{
@@ -319,7 +293,6 @@ jobs:
                commit:     $commit,
                image:      $image,
                digest:     $digest,
-               imageId:    $imageId,
                artifact:   $artifact,
                built_at:   $built_at
              }' > release.json
@@ -338,7 +311,7 @@ jobs:
 
             Image (tag + digest):
             ```
-            ${{ steps.imagedigest.outputs.image }}@${{ steps.imagedigest.outputs.digest }}
+            ${{ steps.imgmeta.outputs.image }}@${{ steps.imgmeta.outputs.digest }}
             ```
 
             Artifact checksum (SHA256) attached in `tar-sha256.txt`.
@@ -364,10 +337,13 @@ jobs:
           PKG="jar"
           [[ "$ART_ABS" == *.tar.gz ]] && PKG="tar.gz"
 
+          echo "Using settings: $GITHUB_WORKSPACE/settings.xml"
+          test -f "$GITHUB_WORKSPACE/settings.xml" || { echo "::error::settings.xml not found at repo root"; exit 1; }
+
           echo "Attaching:"
           ls -l "$ART_ABS" "$DIG_ABS" "$SHA_ABS" "$JSON_ABS"
 
-          mvn -B -s "${{ env.MAVEN_SETTINGS_FILE }}" \
+          mvn -B -s "$GITHUB_WORKSPACE/settings.xml" \
             org.codehaus.mojo:build-helper-maven-plugin:3.6.1:attach-artifact \
             -Dartifacts="${ART_ABS},${PKG},dist;${DIG_ABS},txt,image-digest;${SHA_ABS},txt,tar-sha256;${JSON_ABS},json,metadata"
 
@@ -375,7 +351,7 @@ jobs:
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         working-directory: ${{ steps.artifact.outputs.module_dir }}
         run: |
-          mvn -B -s "${{ env.MAVEN_SETTINGS_FILE }}" -DskipTests deploy
+          mvn -B -s "$GITHUB_WORKSPACE/settings.xml" -DskipTests deploy
 
       - name: Bump back to next SNAPSHOT and push
         if: ${{ steps.flags.outputs.is_release == 'true' }}
@@ -428,7 +404,7 @@ jobs:
           IMAGE=""; DIGEST=""; VERSION=""
           if [[ -f release.json ]]; then
             IMAGE=$(jq -r '.image // empty' release.json)
-            DIGEST=$(jq -r '.digest // .imageId // empty' release.json)
+            DIGEST=$(jq -r '.digest // empty' release.json)
             VERSION=$(jq -r '.version // empty' release.json)
           fi
           if [[ -z "$IMAGE" && -f image-digest.txt ]]; then
