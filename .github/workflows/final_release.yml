@@ -1,4 +1,4 @@
-name: Final Release
+name: Build / Release
 
 on:
   workflow_dispatch:
@@ -75,20 +75,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ARTIFACT_ID=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='artifactId'])" pom.xml)
-          GROUP_ID=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='groupId'])" pom.xml 2>/dev/null || true)
+          ARTIFACT_ID=$(xmllint --xpath "string(/*[local-name()='project']/*[local-name()='artifactId'])" pom.xml)
+          GROUP_ID=$(xmllint --xpath "string(/*[local-name()='project']/*[local-name()='groupId'])" pom.xml 2>/dev/null || true)
           if [[ -z "$GROUP_ID" ]]; then
-            GROUP_ID=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='parent']/*[local-name()='groupId'])" pom.xml 2>/dev/null || true)
+            GROUP_ID=$(xmllint --xpath "string(/*[local-name()='project']/*[local-name()='parent']/*[local-name()='groupId'])" pom.xml 2>/dev/null || true)
           fi
-          RAW_VERSION=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='version'])" pom.xml)
+          RAW_VERSION=$(xmllint --xpath "string(/*[local-name()='project']/*[local-name()='version'])" pom.xml)
           RELEASE_VERSION="${RAW_VERSION%-SNAPSHOT}"
           IFS='.' read -r MAJ MIN PAT <<< "${RELEASE_VERSION}"; PAT=${PAT:-0}; NEXT_VERSION="${MAJ}.${MIN}.$((PAT+1))-SNAPSHOT"
           RELEASE_TAG="${ARTIFACT_ID}-${RELEASE_VERSION}"
 
-          SNAP_ID=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='distributionManagement']/*[local-name()='snapshotRepository']/*[local-name()='id'])" pom.xml 2>/dev/null || true)
-          SNAP_URL=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='distributionManagement']/*[local-name()='snapshotRepository']/*[local-name()='url'])" pom.xml 2>/dev/null || true)
-          REL_ID=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='distributionManagement']/*[local-name()='repository']/*[local-name()='id'])" pom.xml 2>/dev/null || true)
-          REL_URL=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='distributionManagement']/*[local-name()='repository']/*[local-name()='url'])" pom.xml 2>/dev/null || true)
+          SNAP_ID=$(xmllint --xpath "string(/*[local-name()='project']/*[local-name()='distributionManagement']/*[local-name()='snapshotRepository']/*[local-name()='id'])" pom.xml 2>/dev/null || true)
+          SNAP_URL=$(xmllint --xpath "string(/*[local-name']=='project']/*[local-name()='distributionManagement']/*[local-name()='snapshotRepository']/*[local-name()='url'])" pom.xml 2>/dev/null || true)
+          REL_ID=$(xmllint --xpath "string(/*[local-name()='project']/*[local-name()='distributionManagement']/*[local-name()='repository']/*[local-name()='id'])" pom.xml 2>/dev/null || true)
+          REL_URL=$(xmllint --xpath "string(/*[local-name()='project']/*[local-name()='distributionManagement']/*[local-name()='repository']/*[local-name()='url'])" pom.xml 2>/dev/null || true)
 
           [[ -n "$ARTIFACT_ID" && -n "$GROUP_ID" && -n "$RAW_VERSION" ]] || { echo "::error::Failed to derive GAV from pom.xml"; exit 1; }
 
@@ -181,15 +181,7 @@ jobs:
         run: |
           mvn -q -s "${MAVEN_SETTINGS_FILE}" -DskipTests -U clean package
 
-      - name: Inspect build outputs
-        if: ${{ steps.flags.outputs.is_release == 'true' }}
-        run: |
-          echo "artifact_id=${{ steps.derive.outputs.artifact_id }}"
-          echo "release_version=${{ steps.derive.outputs.release_version }}"
-          echo "Listing candidate artifacts under */target/*:"
-          find . -type f -path "*/target/*" \( -name "*.tar.gz" -o -name "*.jar" \) -print
-
-      - name: Locate artifact (robust: prefers tar.gz, then jar)
+      - name: Locate artifact (prefer tar.gz, fallback jar) + module dir
         id: artifact
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         shell: bash
@@ -198,24 +190,23 @@ jobs:
           A="${{ steps.derive.outputs.artifact_id }}"
           V="${{ steps.derive.outputs.release_version }}"
 
-          F="$(find . -type f -path '*/target/*' -name "${A}-${V}.tar.gz" | head -n1 || true)"
-          if [[ -n "$F" ]]; then echo "artifact_path=$F" >> "$GITHUB_OUTPUT"; exit 0; fi
+          pick() { find . -type f -path '*/target/*' "$@" -print | head -n1 || true; }
 
-          F="$(find . -type f -path '*/target/*' -name "${A}-${V}.jar" ! -name "*-sources.jar" ! -name "*-javadoc.jar" ! -name "*original*.jar" ! -name "*-plain.jar" | head -n1 || true)"
-          if [[ -n "$F" ]]; then echo "artifact_path=$F" >> "$GITHUB_OUTPUT"; exit 0; fi
-
-          F="$(find . -type f -path '*/target/*' -name "*.tar.gz" | grep "/${A}-" | grep "${V}" | head -n1 || true)"
-          if [[ -n "$F" ]]; then echo "artifact_path=$F" >> "$GITHUB_OUTPUT"; exit 0; fi
-
-          F="$(find . -type f -path '*/target/*' -name "*.jar" ! -name "*-sources.jar" ! -name "*-javadoc.jar" ! -name "*original*.jar" ! -name "*-plain.jar" -printf '%T@ %p\n' | sort -nr | cut -d' ' -f2- | head -n1 || true)"
-          if [[ -n "$F" ]]; then
-            echo "::warning::Falling back to newest jar: $F"
-            echo "artifact_path=$F" >> "$GITHUB_OUTPUT"
-            exit 0
+          F="$(pick -name "${A}-${V}.tar.gz")"
+          if [[ -z "$F" ]]; then
+            F="$(pick \( -name "${A}-${V}.jar" -o -name "*.jar" \) \
+                  ! -name "*-sources.jar" ! -name "*-javadoc.jar" \
+                  ! -name "*original*.jar" ! -name "*-plain.jar")"
           fi
+          [[ -n "$F" ]] || { echo "::error::No tar.gz or suitable jar under */target/*"; exit 1; }
 
-          echo "::error::Could not locate a .tar.gz or a suitable .jar under */target/*"
-          exit 1
+          case "$F" in (./*) :;; (*) F="./$F";; esac
+          MOD_DIR="$(dirname "$(dirname "$F")")"   # parent of target/
+
+          echo "artifact_path=$F"     >> "$GITHUB_OUTPUT"
+          echo "module_dir=$MOD_DIR"  >> "$GITHUB_OUTPUT"
+          echo "Picked artifact: $F"
+          echo "Module dir: $MOD_DIR"
 
       # ---------- ONE Docker build/push step (for BOTH paths) ----------
       - name: Resolve APP_VERSION (release vs snapshot)
@@ -237,7 +228,7 @@ jobs:
           echo "registry=artifactory.gmail.com/paas-registry" >> "$GITHUB_OUTPUT"
           echo "dockerfile_path=${{ env.DOCKERFILE_PATH }}" >> "$GITHUB_OUTPUT"
           echo "build_path=${{ env.BUILD_PATH }}" >> "$GITHUB_OUTPUT"
-          echo "image_name=${{ steps.derive.outputs.artifact_id }}-image" >> "$GITHUB_OUTPUT"
+          echo "image_name=${{ steps.derive.outputs.artifact_id }}" >> "$GITHUB_OUTPUT"
 
       - name: Build docker image and push to Artifactory
         if: ${{ github.event.inputs.operation != 'Deploy' }}
@@ -253,31 +244,51 @@ jobs:
           build_arg: APP_VERSION=${{ steps.ver.outputs.app_version }}
           push_to_registry: true
 
-      - name: Resolve image digest from Artifactory (v2 API)
+      - name: Docker login for digest lookup
+        if: ${{ github.event.inputs.operation != 'Deploy' }}
+        uses: docker/login-action@v3
+        with:
+          registry: artifactory.gmail.com
+          username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+
+      - name: Resolve image digest from Artifactory (clean image ref)
         if: ${{ github.event.inputs.operation != 'Deploy' }}
         id: imagedigest
         env:
           REGISTRY: ${{ steps.build_defaults.outputs.registry }}
-          IMAGE: ${{ steps.build_defaults.outputs.image_name }}
-          TAG: ${{ steps.ver.outputs.app_version }}
-          AF_USER: ${{ secrets.ARTIFACTORY_USERNAME }}
-          AF_PASS: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          IMAGE:    ${{ steps.build_defaults.outputs.image_name }}
+          TAG:      ${{ steps.ver.outputs.app_version }}
+          AF_USER:  ${{ secrets.ARTIFACTORY_USERNAME }}
+          AF_PASS:  ${{ secrets.ARTIFACTORY_PASSWORD }}
         shell: bash
         run: |
           set -euo pipefail
-          HOST="${REGISTRY%%/*}"
-          REPO="${REGISTRY#*/}"
+          REG="${REGISTRY#https://}"; REG="${REG#http://}"
+          HOST="${REG%%/*}"; REPO="${REG#*/}"
+          IMAGE_REF="${REG}/${IMAGE}:${TAG}"
+
           URL="https://${HOST}/v2/${REPO}/${IMAGE}/manifests/${TAG}"
-          DIGEST=$(curl -sI -u "${AF_USER}:${AF_PASS}" -H "Accept: application/vnd.docker.distribution.manifest.v2+json" "$URL" | awk '/Docker-Content-Digest/ {print $2}' | tr -d '\r')
+          DIGEST=$(curl -sI -u "${AF_USER}:${AF_PASS}" \
+                   -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+                   "$URL" | awk '/Docker-Content-Digest/ {print $2}' | tr -d '\r')
+
+          IMGID=""
           if [[ -z "$DIGEST" ]]; then
-            echo "::warning::Could not resolve digest from registry; attempting local fallback."
-            if docker inspect "${REGISTRY}/${IMAGE}:${TAG}" >/dev/null 2>&1; then
-              DIGEST=$(docker inspect --format='{{.Id}}' "${REGISTRY}/${IMAGE}:${TAG}") || true
+            if docker inspect "${IMAGE_REF}" >/dev/null 2>&1; then
+              IMGID=$(docker inspect --format='{{.Id}}' "${IMAGE_REF}" || true)
             fi
           fi
-          echo "image=${REGISTRY}/${IMAGE}:${TAG}" >> "$GITHUB_OUTPUT"
-          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "${REGISTRY}/${IMAGE}:${TAG}@${DIGEST}" | tee image-digest.txt
+
+          echo "image=${IMAGE_REF}"   >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}"     >> "$GITHUB_OUTPUT"
+          echo "imageId=${IMGID}"     >> "$GITHUB_OUTPUT"
+
+          if [[ -n "$DIGEST" ]]; then
+            echo "${IMAGE_REF}@${DIGEST}" | tee image-digest.txt
+          else
+            echo "${IMAGE_REF}@${IMGID:-<digest-unresolved>}" | tee image-digest.txt
+          fi
 
       # ---------- Release-only: checksums, metadata, GH Release, Maven deploy to prod ----------
       - name: Compute artifact SHA256
@@ -285,18 +296,36 @@ jobs:
         run: |
           sha256sum "${{ steps.artifact.outputs.artifact_path }}" | tee tar-sha256.txt
 
-      - name: Write release.json metadata
+      - name: Write release.json metadata (correct fields)
         if: ${{ steps.flags.outputs.is_release == 'true' }}
+        shell: bash
         run: |
-          jq -n --arg artifactId "${{ steps.derive.outputs.artifact_id }}" \
-                --arg version "${{ steps.derive.outputs.release_version }}" \
-                --arg commit "${GITHUB_SHA}" \
-                --arg image "${{ steps.imagedigest.outputs.image }}" \
-                --arg digest "${{ steps.imagedigest.outputs.digest }}" \
-                --arg artifactPath "${{ steps.artifact.outputs.artifact_path }}" \
-                --arg buildTime "$(date -u +%FT%TZ)" \
-                '{artifactId:$artifactId, version:$version, commit:$commit, image:$image, digest:$digest, artifact:$artifactPath, built_at:$buildTime}' \
-            > release.json
+          set -euo pipefail
+          ART_PATH="${{ steps.artifact.outputs.artifact_path }}"
+          case "$ART_PATH" in (./*) :;; (*) ART_PATH="./$ART_PATH";; esac
+
+          jq -n \
+            --arg artifactId "${{ steps.derive.outputs.artifact_id }}" \
+            --arg version    "${{ steps.derive.outputs.release_version }}" \
+            --arg commit     "${GITHUB_SHA}" \
+            --arg image      "${{ steps.imagedigest.outputs.image }}" \
+            --arg digest     "${{ steps.imagedigest.outputs.digest }}" \
+            --arg imageId    "${{ steps.imagedigest.outputs.imageId }}" \
+            --arg artifact   "$ART_PATH" \
+            --arg built_at   "$(date -u +%FT%TZ)" \
+            '{
+               artifactId: $artifactId,
+               version:    $version,
+               commit:     $commit,
+               image:      $image,
+               digest:     $digest,
+               imageId:    $imageId,
+               artifact:   $artifact,
+               built_at:   $built_at
+             }' > release.json
+
+          echo "Wrote release.json:"
+          cat release.json
 
       - name: Create GitHub Release with assets
         if: ${{ steps.flags.outputs.is_release == 'true' }}
@@ -320,69 +349,33 @@ jobs:
             tar-sha256.txt
             release.json
 
-      # Attach extra files as classifiers, then deploy ONCE (avoids 409)
-      - name: Attach release assets as Maven classifiers
+      - name: Attach release assets as Maven classifiers (module-safe, single call)
         if: ${{ steps.flags.outputs.is_release == 'true' }}
+        working-directory: ${{ steps.artifact.outputs.module_dir }}
         shell: bash
         run: |
           set -euo pipefail
-          FILE="${{ steps.artifact.outputs.artifact_path }}"
-          PKG="${FILE##*.}"
-          [[ "$FILE" == *.tar.gz ]] && PKG="tar.gz"
+          ART_REL="${{ steps.artifact.outputs.artifact_path }}"
+          ART_ABS="${GITHUB_WORKSPACE}/${ART_REL#./}"
+          DIG_ABS="${GITHUB_WORKSPACE}/image-digest.txt"
+          SHA_ABS="${GITHUB_WORKSPACE}/tar-sha256.txt"
+          JSON_ABS="${GITHUB_WORKSPACE}/release.json"
 
-          mvn -B -s "${MAVEN_SETTINGS_FILE}" build-helper:attach-artifact \
-            -Dfile="${FILE}" -Dtype="${PKG}" -Dclassifier=dist
+          PKG="jar"
+          [[ "$ART_ABS" == *.tar.gz ]] && PKG="tar.gz"
 
-          mvn -B -s "${MAVEN_SETTINGS_FILE}" build-helper:attach-artifact \
-            -Dfile="image-digest.txt" -Dtype=txt -Dclassifier=image-digest
+          echo "Attaching:"
+          ls -l "$ART_ABS" "$DIG_ABS" "$SHA_ABS" "$JSON_ABS"
 
-          mvn -B -s "${MAVEN_SETTINGS_FILE}" build-helper:attach-artifact \
-            -Dfile="tar-sha256.txt" -Dtype=txt -Dclassifier=tar-sha256
+          mvn -B -s "${{ env.MAVEN_SETTINGS_FILE }}" \
+            org.codehaus.mojo:build-helper-maven-plugin:3.6.1:attach-artifact \
+            -Dartifacts="${ART_ABS},${PKG},dist;${DIG_ABS},txt,image-digest;${SHA_ABS},txt,tar-sha256;${JSON_ABS},json,metadata"
 
-          mvn -B -s "${MAVEN_SETTINGS_FILE}" build-helper:attach-artifact \
-            -Dfile="release.json" -Dtype=json -Dclassifier=metadata
-
-      - name: Deploy all artifacts to prod (single deploy)
+      - name: Deploy all artifacts to prod (single deploy, module-safe)
         if: ${{ steps.flags.outputs.is_release == 'true' }}
+        working-directory: ${{ steps.artifact.outputs.module_dir }}
         run: |
-          mvn -B -s "${MAVEN_SETTINGS_FILE}" -DskipTests deploy
-
-      - name: Verify artifact in Artifactory (release jar + classifiers)
-        if: ${{ steps.flags.outputs.is_release == 'true' }}
-        env:
-          REL_URL: ${{ steps.derive.outputs.rel_url }}
-          GID: ${{ steps.derive.outputs.group_id }}
-          AID: ${{ steps.derive.outputs.artifact_id }}
-          VER: ${{ steps.derive.outputs.release_version }}
-          AF_USER: ${{ secrets.ARTIFACTORY_USERNAME }}
-          AF_PASS: ${{ secrets.ARTIFACTORY_PASSWORD }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          BASE="${REL_URL%/}"
-          GP=${GID//./\/}
-
-          echo "Probing repo: ${BASE}"
-          echo "GAV: ${GID}:${AID}:${VER}"
-
-          URL_JAR="${BASE}/${GP}/${AID}/${VER}/${AID}-${VER}.jar"
-          URL_TAR="${BASE}/${GP}/${AID}/${VER}/${AID}-${VER}-dist.tar.gz"
-          URL_MD="${BASE}/${GP}/${AID}/${VER}/${AID}-${VER}-metadata.json"
-
-          for U in "$URL_JAR" "$URL_TAR" "$URL_MD"; do
-            echo "HEAD $U"
-            if curl -sfI -u "${AF_USER}:${AF_PASS}" "$U" >/dev/null; then
-              echo "✅ Found: $U"
-            else
-              echo "❌ Not found: $U"
-            fi
-          done
-
-          echo "--- GAVC search ---"
-          REPO_KEY=$(basename "$BASE")
-          curl -s -u "${AF_USER}:${AF_PASS}" \
-            "${BASE%/artifactory/*}/artifactory/api/search/gavc?g=${GID}&a=${AID}&v=${VER}&repos=${REPO_KEY}" \
-            | jq .
+          mvn -B -s "${{ env.MAVEN_SETTINGS_FILE }}" -DskipTests deploy
 
       - name: Bump back to next SNAPSHOT and push
         if: ${{ steps.flags.outputs.is_release == 'true' }}
