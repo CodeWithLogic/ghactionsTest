@@ -1,4 +1,4 @@
-name: Release
+name: Build / Release
 
 on:
   workflow_dispatch:
@@ -181,7 +181,7 @@ jobs:
         run: |
           mvn -q -s "${MAVEN_SETTINGS_FILE}" -DskipTests -U clean package
 
-      - name: Locate artifact (prefer tar.gz, fallback jar) + module dir
+      - name: Locate release tarball (STRICT .tar.gz under target)
         id: artifact
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         shell: bash
@@ -190,23 +190,23 @@ jobs:
           A="${{ steps.derive.outputs.artifact_id }}"
           V="${{ steps.derive.outputs.release_version }}"
 
-          pick() { find . -type f -path '*/target/*' "$@" -print | head -n1 || true; }
-
-          F="$(pick -name "${A}-${V}.tar.gz")"
-          if [[ -z "$F" ]]; then
-            F="$(pick \( -name "${A}-${V}.jar" -o -name "*.jar" \) \
-                  ! -name "*-sources.jar" ! -name "*-javadoc.jar" \
-                  ! -name "*original*.jar" ! -name "*-plain.jar")"
+          CAND="$(find . -type f -path '*/target/*' -name "${A}-${V}.tar.gz" | head -n1 || true)"
+          if [[ -z "$CAND" ]]; then
+            CAND="$(find . -type f -path '*/target/*' -name '*.tar.gz' | head -n1 || true)"
           fi
-          [[ -n "$F" ]] || { echo "::error::No tar.gz or suitable jar under */target/*"; exit 1; }
 
-          case "$F" in (./*) :;; (*) F="./$F";; esac
-          MOD_DIR="$(dirname "$(dirname "$F")")"   # parent of target/
+          if [[ -z "$CAND" ]]; then
+            echo "::error::No .tar.gz found under */target/* (we do not upload .jar). Ensure your build creates a tar.gz (e.g., app.tar.gz)."
+            exit 1
+          fi
 
-          echo "artifact_path=$F"     >> "$GITHUB_OUTPUT"
-          echo "module_dir=$MOD_DIR"  >> "$GITHUB_OUTPUT"
-          echo "Picked artifact: $F"
-          echo "Module dir: $MOD_DIR"
+          case "$CAND" in (./*) :;; (*) CAND="./$CAND";; esac
+          MOD_DIR="$(dirname "$(dirname "$CAND")")"
+
+          echo "artifact_path=$CAND"   >> "$GITHUB_OUTPUT"
+          echo "module_dir=$MOD_DIR"   >> "$GITHUB_OUTPUT"
+          echo "Picked tarball: $CAND"
+          echo "Module dir   : $MOD_DIR"
 
       # ---------- ONE Docker build/push step (for BOTH paths) ----------
       - name: Resolve APP_VERSION (release vs snapshot)
@@ -322,7 +322,7 @@ jobs:
             tar-sha256.txt
             release.json
 
-      - name: Attach release assets as Maven classifiers (module-safe, single call)
+      - name: Attach release assets as Maven classifiers (module-safe, per-call)
         if: ${{ steps.flags.outputs.is_release == 'true' }}
         working-directory: ${{ steps.artifact.outputs.module_dir }}
         shell: bash
@@ -333,19 +333,25 @@ jobs:
           DIG_ABS="${GITHUB_WORKSPACE}/image-digest.txt"
           SHA_ABS="${GITHUB_WORKSPACE}/tar-sha256.txt"
           JSON_ABS="${GITHUB_WORKSPACE}/release.json"
+          SETTINGS="${GITHUB_WORKSPACE}/settings.xml"
 
-          PKG="jar"
-          [[ "$ART_ABS" == *.tar.gz ]] && PKG="tar.gz"
+          echo "Using settings: $SETTINGS"
+          test -f "$SETTINGS" || { echo "::error::settings.xml not found at repo root"; exit 1; }
 
-          echo "Using settings: $GITHUB_WORKSPACE/settings.xml"
-          test -f "$GITHUB_WORKSPACE/settings.xml" || { echo "::error::settings.xml not found at repo root"; exit 1; }
-
-          echo "Attaching:"
+          echo "Attaching files:"
           ls -l "$ART_ABS" "$DIG_ABS" "$SHA_ABS" "$JSON_ABS"
 
-          mvn -B -s "$GITHUB_WORKSPACE/settings.xml" \
-            org.codehaus.mojo:build-helper-maven-plugin:3.6.1:attach-artifact \
-            -Dartifacts="${ART_ABS},${PKG},dist;${DIG_ABS},txt,image-digest;${SHA_ABS},txt,tar-sha256;${JSON_ABS},json,metadata"
+          mvn -B -s "$SETTINGS" org.codehaus.mojo:build-helper-maven-plugin:3.6.1:attach-artifact \
+            -Dfile="$ART_ABS" -Dtype=tar.gz -Dclassifier=dist
+
+          mvn -B -s "$SETTINGS" org.codehaus.mojo:build-helper-maven-plugin:3.6.1:attach-artifact \
+            -Dfile="$DIG_ABS" -Dtype=txt -Dclassifier=image-digest
+
+          mvn -B -s "$SETTINGS" org.codehaus.mojo:build-helper-maven-plugin:3.6.1:attach-artifact \
+            -Dfile="$SHA_ABS" -Dtype=txt -Dclassifier=tar-sha256
+
+          mvn -B -s "$SETTINGS" org.codehaus.mojo:build-helper-maven-plugin:3.6.1:attach-artifact \
+            -Dfile="$JSON_ABS" -Dtype=json -Dclassifier=metadata
 
       - name: Deploy all artifacts to prod (single deploy, module-safe)
         if: ${{ steps.flags.outputs.is_release == 'true' }}
