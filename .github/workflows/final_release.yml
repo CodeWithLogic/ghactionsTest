@@ -1,0 +1,523 @@
+name: Final Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Choose operation"
+        required: true
+        type: choice
+        options:
+          - "Build only"
+          - "Build & Deploy"
+          - "Deploy"
+        default: "Build only"
+      release_tag:
+        description: "[Deploy] Existing release tag (e.g., productservice-1.0.0)"
+        required: false
+      manual_env:
+        description: "Target env: e1, e2, or e3 (deploys sequentially up to that env)"
+        required: false
+        default: "e1"
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  # ===========================================
+  # BUILD PATH (Build only / Build & Deploy)
+  # ===========================================
+  pipeline:
+    if: ${{ github.event.inputs.operation != 'Deploy' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      image: ${{ steps.imagedigest.outputs.image }}
+      digest: ${{ steps.imagedigest.outputs.digest }}
+      release_tag: ${{ steps.derive.outputs.release_tag }}
+      version: ${{ steps.derive.outputs.release_version }}
+    env:
+      DOCKERFILE_PATH: Dockerfile
+      BUILD_PATH: .
+      MAVEN_SETTINGS_FILE: settings.xml
+      ARTIFACTORY_USERNAME: ${{ secrets.ARTIFACTORY_USERNAME }}
+      ARTIFACTORY_PASSWORD: ${{ secrets.ARTIFACTORY_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java and Maven
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: Setup Maven
+        uses: stCarolas/setup-maven@v4.5
+        with:
+          maven-version: 3.9.9
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxml2-utils jq
+
+      - name: Verify settings.xml present
+        run: |
+          test -f "${MAVEN_SETTINGS_FILE}" || { echo "::error::Missing ${MAVEN_SETTINGS_FILE} in repo root"; exit 1; }
+
+      - name: Derive GAV and repo info
+        id: derive
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARTIFACT_ID=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='artifactId'])" pom.xml)
+          GROUP_ID=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='groupId'])" pom.xml 2>/dev/null || true)
+          if [[ -z "$GROUP_ID" ]]; then
+            GROUP_ID=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='parent']/*[local-name()='groupId'])" pom.xml 2>/dev/null || true)
+          fi
+          RAW_VERSION=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='version'])" pom.xml)
+          RELEASE_VERSION="${RAW_VERSION%-SNAPSHOT}"
+          IFS='.' read -r MAJ MIN PAT <<< "${RELEASE_VERSION}"; PAT=${PAT:-0}; NEXT_VERSION="${MAJ}.${MIN}.$((PAT+1))-SNAPSHOT"
+          RELEASE_TAG="${ARTIFACT_ID}-${RELEASE_VERSION}"
+
+          SNAP_ID=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='distributionManagement']/*[local-name()='snapshotRepository']/*[local-name()='id'])" pom.xml 2>/dev/null || true)
+          SNAP_URL=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='distributionManagement']/*[local-name()='snapshotRepository']/*[local-name()='url'])" pom.xml 2>/dev/null || true)
+          REL_ID=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='distributionManagement']/*[local-name()='repository']/*[local-name()='id'])" pom.xml 2>/dev/null || true)
+          REL_URL=$(xmllint --xpath "string(//*[local-name()='project']/*[local-name()='distributionManagement']/*[local-name()='repository']/*[local-name()='url'])" pom.xml 2>/dev/null || true)
+
+          [[ -n "$ARTIFACT_ID" && -n "$GROUP_ID" && -n "$RAW_VERSION" ]] || { echo "::error::Failed to derive GAV from pom.xml"; exit 1; }
+
+          {
+            echo "artifact_id=$ARTIFACT_ID"
+            echo "group_id=$GROUP_ID"
+            echo "raw_version=$RAW_VERSION"
+            echo "release_version=$RELEASE_VERSION"
+            echo "next_version=$NEXT_VERSION"
+            echo "release_tag=$RELEASE_TAG"
+            echo "snap_id=$SNAP_ID"
+            echo "snap_url=$SNAP_URL"
+            echo "rel_id=$REL_ID"
+            echo "rel_url=$REL_URL"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Decide mode
+        id: flags
+        shell: bash
+        run: |
+          OP="${{ github.event.inputs.operation }}"
+          echo "op=$OP" >> "$GITHUB_OUTPUT"
+          if [[ "$OP" == "Build & Deploy" ]]; then
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---------- Build only (SNAPSHOT) ----------
+      - name: Guard snapshot repo exists
+        if: ${{ steps.flags.outputs.op == 'Build only' }}
+        run: |
+          [[ -n "${{ steps.derive.outputs.snap_id }}" && -n "${{ steps.derive.outputs.snap_url }}" ]] || { 
+            echo "::error::distributionManagement/snapshotRepository missing in pom.xml"; exit 1; 
+          }
+
+      - name: Build and deploy snapshot (to snapshot repo)
+        if: ${{ steps.flags.outputs.op == 'Build only' }}
+        run: |
+          mvn -q -s "${MAVEN_SETTINGS_FILE}" -DskipTests -U clean deploy
+
+      - name: Upload build artifact snapshot
+        if: ${{ steps.flags.outputs.op == 'Build only' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.derive.outputs.artifact_id }}-${{ steps.derive.outputs.raw_version }}-build-${{ github.run_number }}
+          path: "**/target/*"
+          if-no-files-found: error
+
+      # ---------- Build & Deploy (RELEASE) ----------
+      - name: Guard main branch
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: |
+          test "${GITHUB_REF_NAME}" = "main" || { echo "::error::Releases only from main"; exit 1; }
+
+      - name: Guard POM is snapshot before release
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: |
+          case "${{ steps.derive.outputs.raw_version }}" in
+            *-SNAPSHOT) : ;;
+            *) echo "::error::POM must end with -SNAPSHOT before releasing"; exit 1 ;;
+          esac
+
+      - name: Guard release repo exists
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: |
+          [[ -n "${{ steps.derive.outputs.rel_id }}" && -n "${{ steps.derive.outputs.rel_url }}" ]] || { 
+            echo "::error::distributionManagement/repository missing in pom.xml"; exit 1; 
+          }
+
+      - name: Set version to release and commit
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: |
+          mvn -B -s "${MAVEN_SETTINGS_FILE}" versions:set -DnewVersion='${{ steps.derive.outputs.release_version }}'
+          mvn -B -s "${MAVEN_SETTINGS_FILE}" versions:commit
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add pom.xml
+          git commit -m "Release ${{ steps.derive.outputs.artifact_id }} ${{ steps.derive.outputs.release_version }}" || echo "No changes to commit"
+
+      - name: Create and push annotated tag
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: |
+          git tag -a "${{ steps.derive.outputs.release_tag }}" -m "Release ${{ steps.derive.outputs.release_tag }}"
+          git push origin "${GITHUB_REF_NAME}"
+          git push origin "${{ steps.derive.outputs.release_tag }}"
+
+      - name: Build release
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: |
+          mvn -q -s "${MAVEN_SETTINGS_FILE}" -DskipTests -U clean package
+
+      - name: Inspect build outputs
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: |
+          echo "artifact_id=${{ steps.derive.outputs.artifact_id }}"
+          echo "release_version=${{ steps.derive.outputs.release_version }}"
+          echo "Listing candidate artifacts under */target/*:"
+          find . -type f -path "*/target/*" \( -name "*.tar.gz" -o -name "*.jar" \) -print
+
+      - name: Locate artifact (robust: prefers tar.gz, then jar)
+        id: artifact
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          A="${{ steps.derive.outputs.artifact_id }}"
+          V="${{ steps.derive.outputs.release_version }}"
+
+          F="$(find . -type f -path '*/target/*' -name "${A}-${V}.tar.gz" | head -n1 || true)"
+          if [[ -n "$F" ]]; then echo "artifact_path=$F" >> "$GITHUB_OUTPUT"; exit 0; fi
+
+          F="$(find . -type f -path '*/target/*' -name "${A}-${V}.jar" ! -name "*-sources.jar" ! -name "*-javadoc.jar" ! -name "*original*.jar" ! -name "*-plain.jar" | head -n1 || true)"
+          if [[ -n "$F" ]]; then echo "artifact_path=$F" >> "$GITHUB_OUTPUT"; exit 0; fi
+
+          F="$(find . -type f -path '*/target/*' -name "*.tar.gz" | grep "/${A}-" | grep "${V}" | head -n1 || true)"
+          if [[ -n "$F" ]]; then echo "artifact_path=$F" >> "$GITHUB_OUTPUT"; exit 0; fi
+
+          F="$(find . -type f -path '*/target/*' -name "*.jar" ! -name "*-sources.jar" ! -name "*-javadoc.jar" ! -name "*original*.jar" ! -name "*-plain.jar" -printf '%T@ %p\n' | sort -nr | cut -d' ' -f2- | head -n1 || true)"
+          if [[ -n "$F" ]]; then
+            echo "::warning::Falling back to newest jar: $F"
+            echo "artifact_path=$F" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::error::Could not locate a .tar.gz or a suitable .jar under */target/*"
+          exit 1
+
+      # ---------- ONE Docker build/push step (for BOTH paths) ----------
+      - name: Resolve APP_VERSION (release vs snapshot)
+        if: ${{ github.event.inputs.operation != 'Deploy' }}
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${{ steps.flags.outputs.is_release }}" == "true" ]]; then
+            echo "app_version=${{ steps.derive.outputs.release_version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "app_version=${{ steps.derive.outputs.raw_version }}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Resolved APP_VERSION=$(grep '^app_version=' "$GITHUB_OUTPUT" | tail -n1 | cut -d= -f2)"
+
+      - name: Set Docker build defaults
+        if: ${{ github.event.inputs.operation != 'Deploy' }}
+        id: build_defaults
+        run: |
+          echo "registry=artifactory.gmail.com/paas-registry" >> "$GITHUB_OUTPUT"
+          echo "dockerfile_path=${{ env.DOCKERFILE_PATH }}" >> "$GITHUB_OUTPUT"
+          echo "build_path=${{ env.BUILD_PATH }}" >> "$GITHUB_OUTPUT"
+          echo "image_name=${{ steps.derive.outputs.artifact_id }}-image" >> "$GITHUB_OUTPUT"
+
+      - name: Build docker image and push to Artifactory
+        if: ${{ github.event.inputs.operation != 'Deploy' }}
+        id: build_and_push
+        uses: gmail-eng/build-and-push@308a897ba514409179de8046f9baf27fa373b7bc
+        with:
+          registry: ${{ steps.build_defaults.outputs.registry }}
+          name: ${{ steps.build_defaults.outputs.image_name }}
+          username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          dockerfile: ${{ steps.build_defaults.outputs.dockerfile_path }}
+          build_path: ${{ steps.build_defaults.outputs.build_path }}
+          build_arg: APP_VERSION=${{ steps.ver.outputs.app_version }}
+          push_to_registry: true
+
+      - name: Resolve image digest from Artifactory (v2 API)
+        if: ${{ github.event.inputs.operation != 'Deploy' }}
+        id: imagedigest
+        env:
+          REGISTRY: ${{ steps.build_defaults.outputs.registry }}
+          IMAGE: ${{ steps.build_defaults.outputs.image_name }}
+          TAG: ${{ steps.ver.outputs.app_version }}
+          AF_USER: ${{ secrets.ARTIFACTORY_USERNAME }}
+          AF_PASS: ${{ secrets.ARTIFACTORY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOST="${REGISTRY%%/*}"
+          REPO="${REGISTRY#*/}"
+          URL="https://${HOST}/v2/${REPO}/${IMAGE}/manifests/${TAG}"
+          DIGEST=$(curl -sI -u "${AF_USER}:${AF_PASS}" -H "Accept: application/vnd.docker.distribution.manifest.v2+json" "$URL" | awk '/Docker-Content-Digest/ {print $2}' | tr -d '\r')
+          if [[ -z "$DIGEST" ]]; then
+            echo "::warning::Could not resolve digest from registry; attempting local fallback."
+            if docker inspect "${REGISTRY}/${IMAGE}:${TAG}" >/dev/null 2>&1; then
+              DIGEST=$(docker inspect --format='{{.Id}}' "${REGISTRY}/${IMAGE}:${TAG}") || true
+            fi
+          fi
+          echo "image=${REGISTRY}/${IMAGE}:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "${REGISTRY}/${IMAGE}:${TAG}@${DIGEST}" | tee image-digest.txt
+
+      # ---------- Release-only: checksums, metadata, GH Release, Maven deploy to prod ----------
+      - name: Compute artifact SHA256
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: |
+          sha256sum "${{ steps.artifact.outputs.artifact_path }}" | tee tar-sha256.txt
+
+      - name: Write release.json metadata
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: |
+          jq -n --arg artifactId "${{ steps.derive.outputs.artifact_id }}" \
+                --arg version "${{ steps.derive.outputs.release_version }}" \
+                --arg commit "${GITHUB_SHA}" \
+                --arg image "${{ steps.imagedigest.outputs.image }}" \
+                --arg digest "${{ steps.imagedigest.outputs.digest }}" \
+                --arg artifactPath "${{ steps.artifact.outputs.artifact_path }}" \
+                --arg buildTime "$(date -u +%FT%TZ)" \
+                '{artifactId:$artifactId, version:$version, commit:$commit, image:$image, digest:$digest, artifact:$artifactPath, built_at:$buildTime}' \
+            > release.json
+
+      - name: Create GitHub Release with assets
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.derive.outputs.release_tag }}
+          name: ${{ steps.derive.outputs.release_tag }}
+          body: |
+            Automated release **${{ steps.derive.outputs.release_tag }}**
+
+            Image (tag + digest):
+            ```
+            ${{ steps.imagedigest.outputs.image }}@${{ steps.imagedigest.outputs.digest }}
+            ```
+
+            Artifact checksum (SHA256) attached in `tar-sha256.txt`.
+            Machine-readable metadata in `release.json`.
+          files: |
+            ${{ steps.artifact.outputs.artifact_path }}
+            image-digest.txt
+            tar-sha256.txt
+            release.json
+
+      # Attach extra files as classifiers, then deploy ONCE (avoids 409)
+      - name: Attach release assets as Maven classifiers
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE="${{ steps.artifact.outputs.artifact_path }}"
+          PKG="${FILE##*.}"
+          [[ "$FILE" == *.tar.gz ]] && PKG="tar.gz"
+
+          mvn -B -s "${MAVEN_SETTINGS_FILE}" build-helper:attach-artifact \
+            -Dfile="${FILE}" -Dtype="${PKG}" -Dclassifier=dist
+
+          mvn -B -s "${MAVEN_SETTINGS_FILE}" build-helper:attach-artifact \
+            -Dfile="image-digest.txt" -Dtype=txt -Dclassifier=image-digest
+
+          mvn -B -s "${MAVEN_SETTINGS_FILE}" build-helper:attach-artifact \
+            -Dfile="tar-sha256.txt" -Dtype=txt -Dclassifier=tar-sha256
+
+          mvn -B -s "${MAVEN_SETTINGS_FILE}" build-helper:attach-artifact \
+            -Dfile="release.json" -Dtype=json -Dclassifier=metadata
+
+      - name: Deploy all artifacts to prod (single deploy)
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: |
+          mvn -B -s "${MAVEN_SETTINGS_FILE}" -DskipTests deploy
+
+      - name: Verify artifact in Artifactory (release jar + classifiers)
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        env:
+          REL_URL: ${{ steps.derive.outputs.rel_url }}
+          GID: ${{ steps.derive.outputs.group_id }}
+          AID: ${{ steps.derive.outputs.artifact_id }}
+          VER: ${{ steps.derive.outputs.release_version }}
+          AF_USER: ${{ secrets.ARTIFACTORY_USERNAME }}
+          AF_PASS: ${{ secrets.ARTIFACTORY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="${REL_URL%/}"
+          GP=${GID//./\/}
+
+          echo "Probing repo: ${BASE}"
+          echo "GAV: ${GID}:${AID}:${VER}"
+
+          URL_JAR="${BASE}/${GP}/${AID}/${VER}/${AID}-${VER}.jar"
+          URL_TAR="${BASE}/${GP}/${AID}/${VER}/${AID}-${VER}-dist.tar.gz"
+          URL_MD="${BASE}/${GP}/${AID}/${VER}/${AID}-${VER}-metadata.json"
+
+          for U in "$URL_JAR" "$URL_TAR" "$URL_MD"; do
+            echo "HEAD $U"
+            if curl -sfI -u "${AF_USER}:${AF_PASS}" "$U" >/dev/null; then
+              echo "✅ Found: $U"
+            else
+              echo "❌ Not found: $U"
+            fi
+          done
+
+          echo "--- GAVC search ---"
+          REPO_KEY=$(basename "$BASE")
+          curl -s -u "${AF_USER}:${AF_PASS}" \
+            "${BASE%/artifactory/*}/artifactory/api/search/gavc?g=${GID}&a=${AID}&v=${VER}&repos=${REPO_KEY}" \
+            | jq .
+
+      - name: Bump back to next SNAPSHOT and push
+        if: ${{ steps.flags.outputs.is_release == 'true' }}
+        run: |
+          mvn -B -s "${MAVEN_SETTINGS_FILE}" versions:set -DnewVersion='${{ steps.derive.outputs.next_version }}'
+          mvn -B -s "${MAVEN_SETTINGS_FILE}" versions:commit
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add pom.xml
+          git commit -m "Bump version to ${{ steps.derive.outputs.next_version }}" || echo "No changes"
+          git push origin "${GITHUB_REF_NAME}"
+
+  # ===========================================
+  # DEPLOY PATH (from an existing tag)
+  # ===========================================
+  fetch_release:
+    if: ${{ github.event.inputs.operation == 'Deploy' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image:  ${{ steps.extract.outputs.image }}
+      digest: ${{ steps.extract.outputs.digest }}
+      version: ${{ steps.extract.outputs.version }}
+    steps:
+      - name: Guard release_tag provided
+        run: |
+          test -n "${{ github.event.inputs.release_tag }}" || { echo "::error::Please provide input release_tag"; exit 1; }
+
+      - name: Install jq
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Download release assets
+        uses: robinraju/release-downloader@v1
+        with:
+          tag: ${{ github.event.inputs.release_tag }}
+          fileName: |
+            image-digest.txt
+            tar-sha256.txt
+            release.json
+          tarBall: false
+          zipBall: false
+
+      - name: Extract image and digest from assets
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE=""; DIGEST=""; VERSION=""
+          if [[ -f release.json ]]; then
+            IMAGE=$(jq -r '.image // empty' release.json)
+            DIGEST=$(jq -r '.digest // .imageId // empty' release.json)
+            VERSION=$(jq -r '.version // empty' release.json)
+          fi
+          if [[ -z "$IMAGE" && -f image-digest.txt ]]; then
+            IMAGE=$(cut -d'@' -f1 image-digest.txt || true)
+            DIGEST=$(cut -d'@' -f2 image-digest.txt || true)
+          fi
+          [[ -n "$IMAGE" && -n "$DIGEST" ]] || { echo "::error::Could not resolve image/digest from release assets"; exit 1; }
+          echo "image=$IMAGE"   >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  deploy_e1:
+    if: ${{ github.event.inputs.operation == 'Deploy' && (github.event.inputs.manual_env == 'e1' || github.event.inputs.manual_env == 'e2' || github.event.inputs.manual_env == 'e3') }}
+    needs: [fetch_release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate ensure image matches release e1
+        run: |
+          echo "e1 will deploy: ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
+      - name: Deploy to e1 dummy
+        run: |
+          echo "Pretend deploy e1 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
+
+  deploy_e2:
+    if: ${{ github.event.inputs.operation == 'Deploy' && (github.event.inputs.manual_env == 'e2' || github.event.inputs.manual_env == 'e3') }}
+    needs: [fetch_release, deploy_e1]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate ensure image matches release e2
+        run: |
+          echo "e2 will deploy: ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
+      - name: Deploy to e2 dummy
+        run: |
+          echo "Pretend deploy e2 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
+
+  deploy_e3:
+    if: ${{ github.event.inputs.operation == 'Deploy' && github.event.inputs.manual_env == 'e3' }}
+    needs: [fetch_release, deploy_e2]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate ensure image matches release e3
+        run: |
+          echo "e3 will deploy: ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
+      - name: Deploy to e3 dummy
+        run: |
+          echo "Pretend deploy e3 with ${{ needs.fetch_release.outputs.image }}@${{ needs.fetch_release.outputs.digest }}"
+
+  # ===========================================
+  # BUILD-&-DEPLOY PATH (same run, after build)
+  # ===========================================
+  bd_deploy_e1:
+    if: ${{ github.event.inputs.operation == 'Build & Deploy' && (github.event.inputs.manual_env == 'e1' || github.event.inputs.manual_env == 'e2' || github.event.inputs.manual_env == 'e3') }}
+    needs: [pipeline]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate ensure image from build e1
+        run: |
+          echo "e1 will deploy: ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+      - name: Deploy to e1 dummy
+        run: |
+          echo "Pretend deploy e1 with ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+
+  bd_deploy_e2:
+    if: ${{ github.event.inputs.operation == 'Build & Deploy' && (github.event.inputs.manual_env == 'e2' || github.event.inputs.manual_env == 'e3') }}
+    needs: [pipeline, bd_deploy_e1]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate ensure image from build e2
+        run: |
+          echo "e2 will deploy: ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+      - name: Deploy to e2 dummy
+        run: |
+          echo "Pretend deploy e2 with ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+
+  bd_deploy_e3:
+    if: ${{ github.event.inputs.operation == 'Build & Deploy' && github.event.inputs.manual_env == 'e3' }}
+    needs: [pipeline, bd_deploy_e2]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate ensure image from build e3
+        run: |
+          echo "e3 will deploy: ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
+      - name: Deploy to e3 dummy
+        run: |
+          echo "Pretend deploy e3 with ${{ needs.pipeline.outputs.image }}@${{ needs.pipeline.outputs.digest }}"
