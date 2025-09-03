@@ -1,0 +1,45 @@
+name: Test Approval Flow
+
+on:
+  workflow_dispatch: {}  # 👈 lets you trigger manually from GitHub UI
+
+jobs:
+  run_tests_e1:
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.probe.outputs.status }}
+    steps:
+      - name: Probe endpoint
+        id: probe
+        shell: bash
+        run: |
+          set +e
+          CODE=$(curl -sS -o /dev/null -w "%{http_code}" https://httpbin.org/status/500)
+          echo "HTTP code: $CODE"
+
+          if [ "$CODE" = "200" ]; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Never fail the job itself
+          exit 0
+
+  wait-for-approval:
+    needs: [run_tests_e1]
+    if: ${{ needs.run_tests_e1.outputs.result == 'failure' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: manual-approval   # requires reviewers set in repo settings
+    steps:
+      - run: echo "Probe failed; waiting for manual approval…"
+
+  next_job:
+    needs: [run_tests_e1, wait-for-approval]
+    runs-on: ubuntu-latest
+    if: ${{ needs.run_tests_e1.outputs.result == 'success'
+            || (needs.run_tests_e1.outputs.result == 'failure'
+                && needs.wait-for-approval.result == 'success') }}
+    steps:
+      - run: echo "Proceeding with next steps…"
